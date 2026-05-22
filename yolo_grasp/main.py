@@ -3,53 +3,63 @@
 """yolo_grasp_rbnx — geometric grasp-pose estimator service.
 
 Owns ``robonix/service/perception/grasp_pose/*``. Pure CPU — no ML
-model. Implements the geometric / heuristic logic the live pipeline
-already uses (detect_grasp/yolo_grasp.py upstream): given a YOLO 3D
-bbox + center, pick a grasp pose along the camera Z axis with a
-fixed standard gripper width.
+model. Implements the geometric / heuristic logic from the live
+upstream pipeline (``detect_grasp/yolo_grasp.py``):
 
-Two parallel surfaces, sharing one estimator function:
+  * given a YOLO 2D bounding box on the RGB frame, take the bbox
+    center pixel, sample a median depth value from a grid inside
+    the bbox, then back-project the (u, v, z) tuple through the
+    camera intrinsics K into the camera optical frame.
+  * write a pre-calibrated approach quaternion onto that 3D point
+    (the orientation is constant — the live pipeline doesn't try
+    to estimate orientation from geometry, it reuses a single
+    standard top-down approach with a slight tilt).
+  * subtract a small "safe height" from z so the gripper finishes
+    ABOVE the object (the moveit cartesian descent finishes the
+    last 10 cm).
+  * gripper width is clamped to [min, max] from config (default
+    [0.0, 0.12] m) — upstream literally hardcodes 0.12.
 
-    1. Atlas-routed MCP   (the new path, what Pilot's LLM sees)
+Three surfaces, sharing one ``_compute_grasp()`` math kernel:
+
+  1. **Atlas-routed MCP RPC** (the new path, what Pilot's LLM sees)
        robonix/service/perception/grasp_pose/grasp_request
-       — input/output: GraspRequest_Request / _Response (codegen'd
-         from capabilities/lib/grasp/srv/GraspRequest.srv)
+       — input/output: ``GraspRequest_Request`` / ``_Response``
+         (codegen'd from capabilities/lib/grasp/srv/GraspRequest.srv)
 
-    2. Legacy ROS service (compat path, what pick.py + the C++
-       moveit_control subscriber still call/listen-to)
-       /graspnet/grasp_request  (graspnet_msgs/srv/GraspRequest)
+  2. **Legacy ROS service** (compat path for pick.py + the C++
+     moveit_control subscriber)
+       /graspnet/grasp_request   (graspnet_msgs/srv/GraspRequest)
        + /graspnet/grasps topic  (graspnet_msgs/msg/GraspPose)
 
-Plus a *third* role: this package CALLS yolo_world_rbnx as a CLIENT
-(via ROS service /yolo/detect_object) when bbox_2d / object_center_3d
-are not provided by the caller.
+  3. **Auto-publish stream mode** (matches upstream yolo_grasp.py
+     behaviour). When ``cfg.auto_publish_topic`` is true (default),
+     subscribe to ``cfg.detect_objects_topic`` (default
+     ``/yolo/detect_objects``, the legacy YOLOE publisher), and
+     for every incoming ``DetectedObjects`` message:
+       * pick the first detection whose ``object_name`` is in
+         ``cfg.candidates`` (a configurable allowlist defaulting to
+         the upstream list).
+       * compute a grasp via ``_compute_grasp()`` and publish to
+         ``/graspnet/grasps`` — fire-and-forget.
+     This is what makes the legacy yolo_world → yolo_grasp →
+     piper_moveit_control pipeline work without any caller code.
 
 Lifecycle (per Robonix developer guide §5):
-    on_init      — light-medium: parse cfg, atlas-resolve upstream
-                   detect_object endpoint (informational; we still
-                   call via ROS service for compat), spawn rclpy
-                   thread (ROS service host + topic publisher +
-                   detect_object client).
-    on_deactivate — stop rclpy thread.
+    on_init         — parse cfg, atlas-resolve detect_object endpoint
+                      (informational), spawn rclpy thread (subs +
+                      pubs + service host).
+    on_deactivate   — stop rclpy thread; publish a zero-pose to
+                      /graspnet/grasps so subscribers see "service
+                      stopped" instead of stale data.
 
-Placeholder note (2026-05-19):
-    The real grasp-pose algorithm lives at
-    `/home/syswonder/lhw/detect_grasp/yolo_grasp.py` on the deploy
-    machine, not in this workspace yet. Until that file lands, this
-    package ships a STUB estimator that:
-      * registers all the right contracts and ROS topics so the
-        pipeline plumbing can be tested;
-      * returns success=false with a clear "placeholder" message
-        on every grasp_request call;
-      * is structured so dropping in the real implementation is a
-        single function replace (see _estimate_grasp_pose below).
-
-When the real yolo_grasp.py is available:
-    1. Copy it to yolo_grasp/_upstream/yolo_grasp.py (overwrite
-       the placeholder shipped here).
-    2. Edit `_estimate_grasp_pose` in this file to forward to the
-       upstream estimator function (or just inline the logic).
-    3. Remove the IS_PLACEHOLDER guard.
+Notable algorithmic detail removed from upstream:
+    upstream yolo_grasp.py blocks the ROS spin thread on
+    ``input("Continue? [y/n]")`` every 10 detections. That is a
+    debugging hook for an interactive shell; rbnx-spawned providers
+    have stdin closed (no tty), so input() raises EOFError and the
+    lifecycle thread crashes. We removed it. If you want
+    rate-limiting, set cfg.auto_publish_min_interval_s > 0.
 """
 from __future__ import annotations
 
@@ -59,7 +69,6 @@ import math
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 from robonix_api import ATLAS, Service, Ok, Err  # noqa: E402
@@ -75,30 +84,51 @@ yolo_grasp = Service(
     namespace="robonix/service/perception/grasp_pose",
 )
 
-# ── placeholder guard ────────────────────────────────────────────────────────
-# Set to False when the real upstream yolo_grasp.py logic is wired into
-# _estimate_grasp_pose. Until then, every grasp_request returns a
-# clean "placeholder" failure instead of silently producing a bogus
-# pose that the arm could try to execute.
-IS_PLACEHOLDER = True
+# ── default candidates allowlist (matches upstream yolo_grasp.py) ───────────
+# When auto_publish_topic is on and a DetectedObjects message arrives,
+# we pick the FIRST detection whose object_name is in this list. The
+# list is configurable per-deploy via cfg.candidates.
+_DEFAULT_CANDIDATES: list[str] = [
+    "bookmark", "lamp", "test tube", "vacuum", "flyer", "movie ticket",
+    "poster page", "paper", "paper bag", "payphone", "placard",
+    "sheet music", "document", "monitor", "decorative picture",
+]
+
+# Pre-calibrated approach quaternion from upstream yolo_grasp.py.
+# This is a single fixed top-down orientation; the live pipeline
+# does NOT estimate orientation from geometry. Replace via cfg
+# (orientation_xyzw) only if you've recalibrated.
+_DEFAULT_QUAT = (-0.1329, 0.1508, -0.6840, -0.7013)
 
 # ── shared state ────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 _initialized = False
-_resolved_cfg: Optional[dict[str, Any]] = None
+_resolved_cfg: dict[str, Any] = {}
 
 _ros_node = None
 _ros_thread: Optional[threading.Thread] = None
 _ros_stop_evt = threading.Event()
 _grasps_pub = None       # /graspnet/grasps publisher
-_detect_client = None    # /yolo/detect_object service client
+
+# Latest depth + camera_info (subscribers update these from the rclpy
+# thread; readers — service handlers + auto-publish callback — read
+# under _state_lock). Both are raw ROS messages, decoded lazily.
+_latest_depth_msg = None         # sensor_msgs/Image
+_latest_cam_info = None          # sensor_msgs/CameraInfo
+
+# auto-publish rate limit
+_last_auto_publish_time = 0.0
+
+# /yolo/detect_object client (used when MCP / ROS service caller
+# didn't supply a bbox themselves)
+_detect_client = None
 
 
 # ── atlas: resolve upstream detect_object (informational) ───────────────────
 def _resolve_detect_object_endpoint() -> Optional[str]:
     """Query atlas for object_detect's MCP endpoint. We don't use the
-    MCP path yet (Stage 6 will), but logging it is a useful sanity
-    check that yolo_world_rbnx is up before we proceed."""
+    MCP path yet (Stage 6 will); logging it is just a sanity check
+    that yolo_world_rbnx is up before we proceed."""
     cid = "robonix/service/perception/object_detect/detect_object"
     try:
         caps = ATLAS.find_capability(contract_id=cid, transport="mcp")
@@ -127,90 +157,221 @@ def _resolve_detect_object_endpoint() -> Optional[str]:
         return None
 
 
-# ── grasp-pose estimator (PLACEHOLDER — replace with upstream logic) ────────
-def _estimate_grasp_pose(
-    object_name: str,
+# ── geometry: depth → metric helpers ────────────────────────────────────────
+def _depth_to_numpy(depth_msg) -> Optional["object"]:
+    """Convert a sensor_msgs/Image depth frame to numpy (meters,
+    float32). Returns None on unsupported encoding."""
+    import numpy as np
+    from cv_bridge import CvBridge
+    bridge = _depth_to_numpy._bridge  # type: ignore[attr-defined]
+    try:
+        arr = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+    except Exception as e:  # noqa: BLE001
+        log.error("cv_bridge conversion failed: %s", e)
+        return None
+    a = np.asarray(arr)
+    if depth_msg.encoding in ("16UC1", "mono16"):
+        return a.astype(np.float32) * 0.001  # mm → m
+    if depth_msg.encoding == "32FC1":
+        return a.astype(np.float32)
+    log.error("unsupported depth encoding: %s", depth_msg.encoding)
+    return None
+
+
+def _depth_median_in_bbox(depth_m, bbox, *, grid: int,
+                          min_depth: float, max_depth: float) -> Optional[float]:
+    """Sample a `grid x grid` lattice inside bbox; return median of
+    depths within [min, max] meters. Returns None if no valid sample."""
+    import numpy as np
+    h, w = depth_m.shape[:2]
+    x_min, y_min, x_max, y_max = bbox
+    x0 = int(np.clip(math.floor(x_min), 0, w - 1))
+    x1 = int(np.clip(math.ceil(x_max),  0, w - 1))
+    y0 = int(np.clip(math.floor(y_min), 0, h - 1))
+    y1 = int(np.clip(math.ceil(y_max),  0, h - 1))
+    g = max(3, int(grid))
+    xs = np.linspace(x0, x1, g).astype(int)
+    ys = np.linspace(y0, y1, g).astype(int)
+    samples = []
+    for yy in ys:
+        for xx in xs:
+            z = float(depth_m[yy, xx])
+            if np.isfinite(z) and min_depth <= z <= max_depth and z > 0.0:
+                samples.append(z)
+    if not samples:
+        return None
+    return float(np.median(np.asarray(samples, dtype=np.float32)))
+
+
+def _parse_intrinsics(cam_info) -> tuple[float, float, float, float]:
+    """Return (fx, fy, cx, cy) from a sensor_msgs/CameraInfo."""
+    K = cam_info.k  # row-major: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+    return float(K[0]), float(K[4]), float(K[2]), float(K[5])
+
+
+def _compute_grasp(
+    *,
     bbox_2d: list[float],
-    object_center_3d: list[float],
-    retry: int,
+    depth_msg,
+    cam_info,
+    cfg: dict[str, Any],
+    object_name: str = "",
 ) -> dict:
-    """Stub: returns success=false with a placeholder message.
+    """Pure geometric grasp computation. The math kernel shared by
+    all three surfaces (MCP RPC, ROS service, auto-publish stream).
 
-    When the real yolo_grasp.py lands, replace this body with the
-    upstream estimator. The expected output dict keys are:
-      {
-        "success":       bool,
-        "message":       str,
-        "pose":          {position: {x, y, z},
-                          orientation: {x, y, z, w}},
-        "frame_id":      str,           # always "camera_color_optical_frame"
-        "gripper_width": float,
-        "score":         float,
-      }
-    """
-    if IS_PLACEHOLDER:
-        return {
-            "success":       False,
-            "message":       (
-                "yolo_grasp_rbnx is in PLACEHOLDER mode — copy the real "
-                "/home/syswonder/lhw/detect_grasp/yolo_grasp.py into "
-                "yolo_grasp/_upstream/, port the math into "
-                "_estimate_grasp_pose, then flip IS_PLACEHOLDER=False"),
-            "pose":          {
-                "position":    {"x": 0.0, "y": 0.0, "z": 0.0},
-                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-            },
-            "frame_id":      "camera_color_optical_frame",
-            "gripper_width": 0.0,
-            "score":         0.0,
+    Returns the same dict shape regardless of success/failure:
+        {
+          "success":       bool,
+          "message":       str,
+          "pose":          {position: {x, y, z},
+                            orientation: {x, y, z, w}},
+          "frame_id":      str,
+          "gripper_width": float,
+          "score":         float,
         }
+    """
+    import numpy as np
 
-    # === real estimator goes below this line ===
-    # The upstream logic is roughly:
-    #   1. If bbox_2d / object_center_3d empty, call /yolo/detect_object.
-    #   2. Pick a grasp axis along camera +Z (top-down approach).
-    #   3. Compute orientation from the camera-frame vertical, with
-    #      yaw biased towards the bbox aspect ratio.
-    #   4. gripper_width = clamp(bbox_2d.short_side * z_depth * fx_scale,
-    #                            min_w, max_w)
-    #   5. score = combination of bbox_conf + depth_validity + ...
-    raise NotImplementedError(
-        "real estimator not wired; see _upstream/yolo_grasp.py")
+    output_frame = cfg.get("output_frame", "camera_color_optical_frame")
+    safe_height_m = float(cfg.get("safe_height_m", 0.10))
+    quat = tuple(cfg.get("orientation_xyzw") or _DEFAULT_QUAT)
+    if len(quat) != 4:
+        quat = _DEFAULT_QUAT
+
+    fail = lambda msg: {  # noqa: E731
+        "success": False, "message": msg,
+        "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                 "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
+        "frame_id": output_frame,
+        "gripper_width": 0.0, "score": 0.0,
+    }
+
+    if depth_msg is None:
+        return fail("no depth frame received yet")
+    if cam_info is None:
+        return fail("no camera_info received yet")
+    if not bbox_2d or len(bbox_2d) != 4:
+        return fail(f"bbox_2d must be length 4, got {bbox_2d!r}")
+
+    x_min, y_min, x_max, y_max = (float(v) for v in bbox_2d)
+    u = 0.5 * (x_min + x_max)
+    v_pix = 0.5 * (y_min + y_max)
+
+    depth_m = _depth_to_numpy(depth_msg)
+    if depth_m is None:
+        return fail(f"unsupported depth encoding: {depth_msg.encoding}")
+
+    z_m = _depth_median_in_bbox(
+        depth_m, (x_min, y_min, x_max, y_max),
+        grid       = int(cfg.get("median_grid",  7)),
+        min_depth  = float(cfg.get("min_depth_m", 0.05)),
+        max_depth  = float(cfg.get("max_depth_m", 3.0)),
+    )
+    if z_m is None:
+        return fail(
+            f"no valid depth in bbox {bbox_2d} (range "
+            f"{cfg.get('min_depth_m', 0.05)}..{cfg.get('max_depth_m', 3.0)} m)")
+
+    fx, fy, cx, cy = _parse_intrinsics(cam_info)
+    if fx <= 0.0 or fy <= 0.0:
+        return fail(f"invalid intrinsics fx={fx} fy={fy}")
+
+    # Pinhole back-projection in optical frame.
+    px = (u     - cx) * z_m / fx
+    py = (v_pix - cy) * z_m / fy
+    pz = z_m - safe_height_m  # safe height: gripper finishes ABOVE the object
+
+    # Gripper width: upstream literally hardcoded 0.12 m, but the
+    # config-clamp shape is preserved so a future deploy can wire
+    # "narrower for small bboxes" without changing this code.
+    width = float(cfg.get("gripper_width_default", 0.12))
+    width = float(np.clip(
+        width,
+        float(cfg.get("gripper_width_min", 0.0)),
+        float(cfg.get("gripper_width_max", 0.12)),
+    ))
+
+    # Score: a crude quality proxy = depth validity * bbox-coverage.
+    # Used by Stage 6 pick_skill to decide whether to retry.
+    bbox_area = max(0.0, (x_max - x_min)) * max(0.0, (y_max - y_min))
+    h_img, w_img = depth_m.shape[:2]
+    rel_area = bbox_area / max(1.0, float(h_img * w_img))
+    score = max(0.0, min(1.0, 0.5 + 0.5 * rel_area))
+
+    return {
+        "success":       True,
+        "message":       f"ok (object={object_name!r}, "
+                         f"u,v=({u:.1f},{v_pix:.1f}), z={z_m:.3f}m)",
+        "pose": {
+            "position":    {"x": float(px), "y": float(py), "z": float(pz)},
+            "orientation": {"x": float(quat[0]), "y": float(quat[1]),
+                            "z": float(quat[2]), "w": float(quat[3])},
+        },
+        "frame_id":      output_frame,
+        "gripper_width": float(width),
+        "score":         float(score),
+    }
 
 
 # ── ROS bring-up (background thread) ────────────────────────────────────────
 def _ros_thread_main() -> None:
     global _ros_node, _grasps_pub, _detect_client
+    global _latest_depth_msg, _latest_cam_info
 
     import rclpy                                              # noqa: E402
     from rclpy.node import Node                               # noqa: E402
+    from sensor_msgs.msg import Image, CameraInfo             # noqa: E402
     from graspnet_msgs.srv import GraspRequest                # noqa: E402
     from graspnet_msgs.srv import ObjectDetectionRequest      # noqa: E402
     from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
+    from graspnet_msgs.msg import DetectedObjects             # noqa: E402
+    from cv_bridge import CvBridge                            # noqa: E402
+
+    # cv_bridge instance attached to the helper for cheap reuse
+    _depth_to_numpy._bridge = CvBridge()  # type: ignore[attr-defined]
 
     rclpy.init(args=None)
     node = Node("yolo_grasp_node")
     _ros_node = node
 
-    # /graspnet/grasps publisher — C++ piper_moveit_control subscribes here.
-    _grasps_pub = node.create_publisher(RosGraspPose, "/graspnet/grasps", 10)
+    cfg = _resolved_cfg
 
-    # /yolo/detect_object client — used when caller didn't supply a bbox.
+    depth_topic    = str(cfg.get("depth_topic",          "/camera/depth/image_raw"))
+    cam_info_topic = str(cfg.get("camera_info_topic",    "/camera/depth/camera_info"))
+    det_topic      = str(cfg.get("detect_objects_topic", "/yolo/detect_objects"))
+    grasps_topic   = str(cfg.get("grasps_topic",         "/graspnet/grasps"))
+
+    # Subscribers — feed the latest depth / camera_info into shared
+    # state. We deliberately keep only the most recent message; older
+    # ones are dropped because grasp_request is always "use what's
+    # current right now". qos depth=10 mirrors upstream.
+    def _on_depth(msg):
+        global _latest_depth_msg
+        with _state_lock:
+            _latest_depth_msg = msg
+
+    def _on_cam_info(msg):
+        global _latest_cam_info
+        with _state_lock:
+            _latest_cam_info = msg
+
+    node.create_subscription(Image,      depth_topic,    _on_depth,    10)
+    node.create_subscription(CameraInfo, cam_info_topic, _on_cam_info, 10)
+    log.info("subscribing depth=%s camera_info=%s", depth_topic, cam_info_topic)
+
+    # Publisher — C++ piper_moveit_control + every other downstream.
+    _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
+    log.info("publishing grasps=%s", grasps_topic)
+
+    # /yolo/detect_object client — only used when caller didn't supply
+    # a bbox (so we ask yolo_world for one). Don't block on its
+    # availability; if it's not up and someone calls grasp_request
+    # without a bbox, _serve_grasp_request will say so.
     _detect_client = node.create_client(
         ObjectDetectionRequest, "/yolo/detect_object")
-    log.info("waiting for /yolo/detect_object service (yolo_world_rbnx)…")
-    waited = 0.0
-    while not _detect_client.wait_for_service(timeout_sec=0.5):
-        if _ros_stop_evt.is_set():
-            return
-        waited += 0.5
-        if waited >= 30.0:
-            log.warning(
-                "/yolo/detect_object not up after 30s — continuing anyway; "
-                "grasp_request calls without bbox will fail until it appears")
-            break
 
-    # /graspnet/grasp_request service host.
+    # /graspnet/grasp_request service host (legacy compat).
     def _grasp_request_cb(req, resp):
         result = _serve_grasp_request(
             object_name      = req.object_name,
@@ -218,17 +379,148 @@ def _ros_thread_main() -> None:
             object_center_3d = list(req.object_center_3d) if req.object_center_3d else [],
             retry            = int(req.retry),
         )
-        # Pack into ROS response.
-        resp.success       = bool(result["success"])
-        resp.message       = str(result["message"])
-        resp.gripper_width = float(result["gripper_width"])
-        resp.score         = float(result["score"])
-        # PoseStamped in result["pose"]:
-        from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion  # noqa
-        ps = PoseStamped()
-        ps.header.stamp = node.get_clock().now().to_msg()
-        ps.header.frame_id = result["frame_id"]
+        _pack_response_and_publish(resp, result, also_publish=False)
+        return resp
+    node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
+    log.info("ROS service up: /graspnet/grasp_request")
+
+    # Optional auto-publish: subscribe to /yolo/detect_objects and
+    # publish grasps for matches against `candidates`.
+    auto_publish = bool(cfg.get("auto_publish_topic", True))
+    candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
+    if auto_publish:
+        log.info("auto_publish_topic ON — subscribing %s, candidates=%d",
+                 det_topic, len(candidates))
+        node.create_subscription(
+            DetectedObjects, det_topic,
+            lambda m: _on_detected_objects(m, candidates), 10)
+    else:
+        log.info("auto_publish_topic OFF — service mode only")
+
+    # Spin until shutdown.
+    while not _ros_stop_evt.is_set():
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+    # Graceful shutdown: emit a zero-pose so subscribers know we're
+    # gone (upstream does this; piper_moveit_control treats zero as
+    # "no grasp pending"). Wrap in try since we may already be in
+    # the middle of rclpy teardown.
+    try:
+        if _grasps_pub is not None:
+            zero = RosGraspPose()
+            _fill_zero_grasp(zero, frame_id=str(cfg.get("output_frame",
+                                                       "camera_color_optical_frame")))
+            _grasps_pub.publish(zero)
+            log.info("published shutdown zero-pose to %s", grasps_topic)
+    except Exception as e:  # noqa: BLE001
+        log.warning("shutdown zero-pose publish failed: %s", e)
+
+    node.destroy_node()
+    rclpy.shutdown()
+    log.info("rclpy thread exited")
+
+
+def _fill_zero_grasp(gp, *, frame_id: str) -> None:
+    """Zero-out a GraspPose msg (upstream sentinel)."""
+    from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion  # noqa: E402
+    if _ros_node is not None:
+        gp.target_pose.header.stamp = _ros_node.get_clock().now().to_msg()
+    gp.target_pose.header.frame_id = frame_id
+    gp.target_pose.pose = Pose(
+        position=Point(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+    )
+    gp.gripper_width = 0.0
+
+
+def _on_detected_objects(msg, candidates: list[str]) -> None:
+    """Auto-publish handler. Picks the first detection whose
+    object_name matches the candidates allowlist, computes a grasp
+    using the latest depth + camera_info, and publishes."""
+    global _last_auto_publish_time
+
+    if not msg.objects:
+        return
+
+    # Optional rate limit (upstream blocked on input(); we just
+    # silently drop. Default 0.0 → no limit, every msg triggers.)
+    min_interval = float(_resolved_cfg.get("auto_publish_min_interval_s", 0.0))
+    if min_interval > 0.0:
+        now = time.monotonic()
+        if (now - _last_auto_publish_time) < min_interval:
+            return
+
+    best = next((o for o in msg.objects if o.object_name in candidates), None)
+    if best is None:
+        # Log once per "burst" — too noisy otherwise on a busy feed.
+        if log.isEnabledFor(logging.DEBUG):
+            seen = ",".join(o.object_name for o in msg.objects[:5])
+            log.debug("no candidate match in detections [%s]", seen)
+        return
+
+    bbox = list(best.bbox_2d)
+    with _state_lock:
+        depth = _latest_depth_msg
+        info  = _latest_cam_info
+    result = _compute_grasp(
+        bbox_2d=bbox, depth_msg=depth, cam_info=info,
+        cfg=_resolved_cfg, object_name=best.object_name,
+    )
+    if not result["success"]:
+        log.warning("auto_publish: %s", result["message"])
+        return
+
+    _publish_to_grasps_topic(result)
+    _last_auto_publish_time = time.monotonic()
+    log.info(
+        "auto_publish %s conf=%.3f -> XYZ=[%.3f, %.3f, %.3f] width=%.3fm",
+        best.object_name, float(getattr(best, "confidence", 0.0)),
+        result["pose"]["position"]["x"], result["pose"]["position"]["y"],
+        result["pose"]["position"]["z"], result["gripper_width"],
+    )
+
+
+def _pack_response_and_publish(resp, result: dict, *, also_publish: bool) -> None:
+    """Stuff a graspnet_msgs/srv/GraspRequest response from a
+    _compute_grasp result, optionally also publishing to /graspnet/grasps."""
+    from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion  # noqa: E402
+    p = result["pose"]
+    ps = PoseStamped()
+    if _ros_node is not None:
+        ps.header.stamp = _ros_node.get_clock().now().to_msg()
+    ps.header.frame_id = result["frame_id"]
+    ps.pose = Pose(
+        position=Point(
+            x=float(p["position"]["x"]),
+            y=float(p["position"]["y"]),
+            z=float(p["position"]["z"])),
+        orientation=Quaternion(
+            x=float(p["orientation"]["x"]),
+            y=float(p["orientation"]["y"]),
+            z=float(p["orientation"]["z"]),
+            w=float(p["orientation"]["w"])),
+    )
+    resp.grasp_pose    = ps
+    resp.gripper_width = float(result["gripper_width"])
+    resp.score         = float(result["score"])
+    resp.success       = bool(result["success"])
+    resp.message       = str(result["message"])
+    if also_publish and result["success"]:
+        _publish_to_grasps_topic(result)
+
+
+def _publish_to_grasps_topic(result: dict) -> None:
+    """Fire-and-forget publish to /graspnet/grasps (legacy topic)."""
+    if _grasps_pub is None:
+        return
+    try:
+        from graspnet_msgs.msg import GraspPose as RosGraspPose  # noqa: E402
+        from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion  # noqa: E402
         p = result["pose"]
+        ps = PoseStamped()
+        if _ros_node is not None:
+            ps.header.stamp = _ros_node.get_clock().now().to_msg()
+        ps.header.frame_id = result["frame_id"]
         ps.pose = Pose(
             position=Point(
                 x=float(p["position"]["x"]),
@@ -240,33 +532,17 @@ def _ros_thread_main() -> None:
                 z=float(p["orientation"]["z"]),
                 w=float(p["orientation"]["w"])),
         )
-        resp.grasp_pose = ps
-
-        # Fire-and-forget topic publish — this is what the legacy C++
-        # subscriber consumes. We publish even on success=false so
-        # subscribers don't sit waiting forever, but a placeholder
-        # response will have all-zero pose + 0 width.
-        if result["success"]:
-            gp = RosGraspPose()
-            gp.target_pose = ps
-            gp.gripper_width = float(result["gripper_width"])
-            _grasps_pub.publish(gp)
-        return resp
-    node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
-    log.info("ROS service up: /graspnet/grasp_request")
-    log.info("ROS publisher up: /graspnet/grasps")
-
-    while not _ros_stop_evt.is_set():
-        rclpy.spin_once(node, timeout_sec=0.1)
-    node.destroy_node()
-    rclpy.shutdown()
-    log.info("rclpy thread exited")
+        gp = RosGraspPose()
+        gp.target_pose = ps
+        gp.gripper_width = float(result["gripper_width"])
+        _grasps_pub.publish(gp)
+    except Exception as e:  # noqa: BLE001
+        log.warning("/graspnet/grasps publish failed: %s", e)
 
 
 def _call_detect_object(object_name: str, timeout_s: float = 5.0) -> dict:
-    """Synchronous client call to /yolo/detect_object (the legacy ROS
-    surface owned by yolo_world_rbnx). Returns the response as a dict
-    with the same keys yolo_world's _detect_object() exposes."""
+    """Synchronous client call to /yolo/detect_object (legacy path
+    owned by yolo_world_rbnx). Used when caller didn't supply bbox."""
     from graspnet_msgs.srv import ObjectDetectionRequest  # noqa: E402
     if _detect_client is None:
         return {"success": False,
@@ -297,13 +573,14 @@ def _call_detect_object(object_name: str, timeout_s: float = 5.0) -> dict:
 
 
 def _serve_grasp_request(*, object_name, bbox_2d, object_center_3d, retry):
-    """Shared handler for both surfaces.
+    """Shared handler for both RPC surfaces (MCP + ROS service).
 
-    If bbox_2d / object_center_3d are missing, we call the upstream
-    yolo_world detect_object service first (legacy ROS path; will swap
-    to MCP in Stage 6).
+    If bbox_2d is missing, we ask yolo_world's detect_object service
+    first. ``object_center_3d`` from the caller is currently advisory
+    only — the geometric estimator always re-back-projects from depth
+    so that "depth at the time of grasp" matches the published TF.
     """
-    if not bbox_2d or not object_center_3d:
+    if not bbox_2d:
         det = _call_detect_object(object_name)
         if not det["success"]:
             return {
@@ -311,14 +588,21 @@ def _serve_grasp_request(*, object_name, bbox_2d, object_center_3d, retry):
                 "message": f"detect_object pre-call failed: {det['message']}",
                 "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
                          "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
-                "frame_id": "camera_color_optical_frame",
+                "frame_id": _resolved_cfg.get("output_frame",
+                                              "camera_color_optical_frame"),
                 "gripper_width": 0.0,
                 "score": 0.0,
             }
-        bbox_2d          = det["bbox_2d"]
-        object_center_3d = det["object_center_3d"]
+        bbox_2d = det["bbox_2d"]
 
-    return _estimate_grasp_pose(object_name, bbox_2d, object_center_3d, retry)
+    with _state_lock:
+        depth = _latest_depth_msg
+        info  = _latest_cam_info
+
+    return _compute_grasp(
+        bbox_2d=bbox_2d, depth_msg=depth, cam_info=info,
+        cfg=_resolved_cfg, object_name=object_name,
+    )
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
@@ -342,21 +626,16 @@ def init(cfg):
             return Err(f"bad config_json: {e}")
     _resolved_cfg = cfg
 
-    if IS_PLACEHOLDER:
-        log.warning(
-            "===========================================================\n"
-            "[yolo_grasp] running in PLACEHOLDER mode!\n"
-            "All grasp_request calls return success=false. Drop in the\n"
-            "real upstream estimator and flip IS_PLACEHOLDER=False to\n"
-            "go live. See yolo_grasp/main.py header for instructions.\n"
-            "===========================================================")
+    log.info("cfg: %d keys (auto_publish=%s, candidates=%d)",
+             len(cfg), cfg.get("auto_publish_topic", True),
+             len(cfg.get("candidates") or _DEFAULT_CANDIDATES))
 
     # Informational: log which provider owns detect_object on atlas.
     _resolve_detect_object_endpoint()
 
-    # Spawn rclpy thread. We don't sentinel-wait on /graspnet/grasp_request
-    # being advertised — the rclpy thread itself is what advertises it,
-    # and on_init returning Ok() is what triggers atlas to mark us ACTIVE.
+    # Spawn rclpy thread. on_init returning Ok() triggers atlas to
+    # mark us ACTIVE; the thread itself is what advertises the
+    # service / topic.
     global _ros_thread
     _ros_stop_evt.clear()
     _ros_thread = threading.Thread(
@@ -389,8 +668,7 @@ def deactivate():
 # Import top-level Request/Response from the package-local IDL, plus
 # the nested geometry_msgs / std_msgs / builtin_interfaces types we
 # need to instantiate. The `_mcp` suffix is codegen's convention:
-# `{ros_package}_mcp.py` per ROS package (see
-# robonix-codegen/src/codegen/mcp_python_gen.rs:4).
+# `{ros_package}_mcp.py` per ROS package.
 from grasp_mcp import (  # noqa: E402  pylint: disable=wrong-import-position
     GraspRequest_Request, GraspRequest_Response,
 )
@@ -403,8 +681,13 @@ from builtin_interfaces_mcp import Time  # noqa: E402
 
 @yolo_grasp.mcp("robonix/service/perception/grasp_pose/grasp_request")
 def grasp_request(req: GraspRequest_Request) -> GraspRequest_Response:
-    """Compute a grasp pose for `req.object_name` (open vocab via
-    upstream YOLOE)."""
+    """Compute a grasp pose for ``req.object_name``.
+
+    If the caller supplies ``bbox_2d`` (length 4 = [x_min, y_min,
+    x_max, y_max] in pixels on the RGB frame), we use it directly.
+    Otherwise we ask yolo_world's /yolo/detect_object service for one
+    on the fly. ``object_center_3d`` from the caller is advisory only.
+    """
     result = _serve_grasp_request(
         object_name      = req.object_name,
         bbox_2d          = list(req.bbox_2d) if req.bbox_2d else [],
@@ -430,34 +713,9 @@ def grasp_request(req: GraspRequest_Request) -> GraspRequest_Response:
         ),
     )
     # Also publish to legacy topic so the C++ piper_moveit_control
-    # subscriber kicks in even if the MCP path is the one being used.
-    if result["success"] and _grasps_pub is not None:
-        try:
-            from graspnet_msgs.msg import GraspPose as RosGraspPose  # noqa: E402
-            from geometry_msgs.msg import (
-                PoseStamped as RosPoseStamped, Pose as RosPose,
-                Point as RosPoint, Quaternion as RosQuaternion)  # noqa: E402
-            ros_ps = RosPoseStamped()
-            if _ros_node is not None:
-                ros_ps.header.stamp = _ros_node.get_clock().now().to_msg()
-            ros_ps.header.frame_id = result["frame_id"]
-            ros_ps.pose = RosPose(
-                position=RosPoint(
-                    x=float(p["position"]["x"]),
-                    y=float(p["position"]["y"]),
-                    z=float(p["position"]["z"])),
-                orientation=RosQuaternion(
-                    x=float(p["orientation"]["x"]),
-                    y=float(p["orientation"]["y"]),
-                    z=float(p["orientation"]["z"]),
-                    w=float(p["orientation"]["w"])),
-            )
-            gp = RosGraspPose()
-            gp.target_pose = ros_ps
-            gp.gripper_width = float(result["gripper_width"])
-            _grasps_pub.publish(gp)
-        except Exception as e:  # noqa: BLE001
-            log.warning("legacy /graspnet/grasps publish failed: %s", e)
+    # subscriber kicks in even if the caller is on the MCP path.
+    if result["success"]:
+        _publish_to_grasps_topic(result)
 
     return GraspRequest_Response(
         grasp_pose    = pose_stamped,

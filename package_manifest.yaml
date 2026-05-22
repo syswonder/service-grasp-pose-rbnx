@@ -10,29 +10,66 @@
 #   * CLIENT (legacy ROS): /yolo/detect_object — owned by yolo_world_rbnx
 #                          (will switch to atlas MCP in Stage 6)
 #
+# Plus a fourth, "auto-publish" mode (default ON): subscribe to the
+# legacy /yolo/detect_objects topic, and for every detection whose
+# object_name is in `cfg.candidates`, compute a grasp + publish to
+# /graspnet/grasps. This is what makes the existing yolo_world →
+# yolo_grasp → piper_moveit_control pipeline work end-to-end without
+# any caller code, exactly like the upstream yolo_grasp.py did. Set
+# auto_publish_topic=false to disable.
+#
 # Lifecycle:
 #   on_init      — light-medium: parse cfg, atlas-resolve detect_object
 #                  endpoint (informational), spawn rclpy thread
-#                  (service host + topic publisher + detect client).
-#   on_deactivate — stop rclpy thread.
+#                  (depth + camera_info + detect_objects subs +
+#                  /graspnet/grasps publisher + service host).
+#   on_deactivate — stop rclpy thread; publish a zero-pose to
+#                   /graspnet/grasps so subscribers see "service stopped".
 #
 # Capability surface (mode = abstract, transport = wire):
 #   service/perception/grasp_pose/driver         mode=rpc        transport=gRPC  Driver(INIT)
 #   service/perception/grasp_pose/grasp_request  mode=rpc        transport=MCP   GraspRequest.srv
 #   service/perception/grasp_pose/grasps         mode=topic_out  transport=ROS2  GraspPose.msg
 #
-# ⚠️ PLACEHOLDER mode — the real grasp-pose math from upstream
-# `/home/syswonder/lhw/detect_grasp/yolo_grasp.py` has not yet been
-# copied into this package. While IS_PLACEHOLDER=True in main.py,
-# every grasp_request returns success=false with a clear message.
-# See README.md "Placeholder mode" for the cutover steps.
+# Config (all keys optional; passed via Driver(CMD_INIT, config_json)):
+#
+#   ── candidate selection (auto-publish stream mode) ──
+#   candidates                  list[str]   default = upstream allowlist of
+#                                            ~15 prompt-free YOLOE class names
+#                                            (bookmark / lamp / paper / etc.)
+#   auto_publish_topic          bool        default true  — subscribe to
+#                                            detect_objects_topic
+#   auto_publish_min_interval_s float       default 0.0   — rate limit (s).
+#                                            0 means publish every detection.
+#
+#   ── ROS topic names (only override when atlas resolution fails) ──
+#   depth_topic                 str         default /camera/depth/image_raw
+#   camera_info_topic           str         default /camera/depth/camera_info
+#   detect_objects_topic        str         default /yolo/detect_objects
+#   grasps_topic                str         default /graspnet/grasps
+#
+#   ── geometric estimator knobs ──
+#   median_grid                 int         default 7    — grid size for
+#                                            median depth sampling inside bbox
+#   min_depth_m                 float       default 0.05
+#   max_depth_m                 float       default 3.0
+#   safe_height_m               float       default 0.10 — z subtracted from
+#                                            depth (gripper finishes ABOVE)
+#   gripper_width_default       float       default 0.12 — pre-clamp width
+#   gripper_width_min           float       default 0.0
+#   gripper_width_max           float       default 0.12
+#   orientation_xyzw            list[float] default [-0.1329, 0.1508,
+#                                            -0.6840, -0.7013] — pre-calibrated
+#                                            top-down approach quaternion
+#   output_frame                str         default camera_color_optical_frame
 #
 # Vendored:
 #   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
-#                        (GraspRequest, GraspPose, ObjectDetectionRequest)
-#   yolo_grasp/_upstream/yolo_grasp.py — the placeholder source from
-#                        /Users/howenliu/lab/grasp/detect_grasp/. The
-#                        real implementation will overwrite this file.
+#                        (GraspRequest, GraspPose, ObjectDetectionRequest,
+#                        DetectedObjects, etc.)
+#   yolo_grasp/_upstream/yolo_grasp.py — preserved upstream source
+#                        (kept as algorithm reference; main.py is what
+#                        actually runs).
 manifestVersion: 1
 
 package:
