@@ -123,6 +123,34 @@ _yolo_chain_source "$OVERLAY" || {
     return 1 2>/dev/null || exit 1
 }
 
+# ── Direct PYTHONPATH / AMENT_PREFIX_PATH injection for graspnet_msgs ──
+# When the calling shell already has another colcon overlay sourced
+# (e.g. ~/.bashrc sources /home/…/tracing_ws/install/setup.bash),
+# colcon's idempotent prefix markers can make the source above silently
+# fail to add our overlay's paths. Inject them by hand to be sure.
+# Idempotent — duplicates are skipped via the case-glob check.
+_GMSGS_PREFIX="${YOLO_GRASP_PKG}/rbnx-build/ws/install/graspnet_msgs"
+if [ -d "$_GMSGS_PREFIX" ]; then
+    case ":${AMENT_PREFIX_PATH:-}:" in
+        *":${_GMSGS_PREFIX}:"*) ;;
+        *) export AMENT_PREFIX_PATH="${_GMSGS_PREFIX}:${AMENT_PREFIX_PATH:-}" ;;
+    esac
+    for _site in \
+        "$_GMSGS_PREFIX"/local/lib/python*/dist-packages \
+        "$_GMSGS_PREFIX"/lib/python*/site-packages \
+        "$_GMSGS_PREFIX"/lib/python*/dist-packages
+    do
+        if [ -d "$_site" ]; then
+            case ":${PYTHONPATH:-}:" in
+                *":${_site}:"*) ;;
+                *) export PYTHONPATH="${_site}:${PYTHONPATH:-}" ;;
+            esac
+        fi
+    done
+    unset _site
+fi
+unset _GMSGS_PREFIX
+
 # 3. Codegen output — atlas_pb2 / grasp_mcp / etc. Match start.sh's
 #    PYTHONPATH ordering so a manual `python3 -m yolo_grasp.main` from
 #    this shell works the same as `rbnx boot` would.

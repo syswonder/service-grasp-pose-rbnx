@@ -34,6 +34,39 @@ else
     exit 2
 fi
 
+# ── Direct PYTHONPATH / AMENT_PREFIX_PATH injection for graspnet_msgs ──
+# Why: when this start.sh runs inside an outer shell that already has
+# ANOTHER colcon overlay sourced (e.g. operator's ~/.bashrc sources
+# /home/.../tracing_ws/install/setup.bash), colcon's idempotent prefix
+# markers can cause our `source $PKG/rbnx-build/ws/install/setup.bash`
+# above to silently NOT add our overlay's paths to AMENT_PREFIX_PATH /
+# PYTHONPATH. The package then `import graspnet_msgs.srv` fails despite
+# the build tree being fully populated. We side-step that by computing
+# the two paths the colcon overlay would add for graspnet_msgs and
+# prepending them ourselves, unconditionally. Idempotent — if colcon
+# DID source correctly, the paths are merely duplicated, not corrupted.
+GMSGS_PREFIX="$PKG/rbnx-build/ws/install/graspnet_msgs"
+if [[ -d "$GMSGS_PREFIX" ]]; then
+    case ":${AMENT_PREFIX_PATH:-}:" in
+        *":${GMSGS_PREFIX}:"*) ;;
+        *) export AMENT_PREFIX_PATH="${GMSGS_PREFIX}:${AMENT_PREFIX_PATH:-}" ;;
+    esac
+    for _site in \
+        "$GMSGS_PREFIX"/local/lib/python*/dist-packages \
+        "$GMSGS_PREFIX"/lib/python*/site-packages \
+        "$GMSGS_PREFIX"/lib/python*/dist-packages
+    do
+        if [[ -d "$_site" ]]; then
+            case ":${PYTHONPATH:-}:" in
+                *":${_site}:"*) ;;
+                *) export PYTHONPATH="${_site}:${PYTHONPATH:-}" ;;
+            esac
+        fi
+    done
+    unset _site
+fi
+unset GMSGS_PREFIX
+
 # ── EXTRA OVERLAYS: explicit user override + auto-discovery ─────────
 # The operator can prepend extra colon-separated setup.bash paths via
 # YOLO_GRASP_EXTRA_OVERLAYS. We try them in order; missing files are
