@@ -211,6 +211,33 @@ cd /Users/howenliu/lab/piper_grasp_deploy
 rbnx boot
 ```
 
+## Manual single-package debugging
+
+`scripts/dev_source.sh` is a helper for running this package by hand
+outside of `rbnx boot` — useful when you need pdb / fast iter / a
+clean stdout. It sources the same overlays / PYTHONPATH that
+`scripts/start.sh` would, and verifies that the vendored
+`graspnet_msgs` is the one importable in this shell.
+
+```bash
+# In a shell that will run python3 -m yolo_grasp.main:
+cd /Users/howenliu/lab/packages/yolo_grasp_rbnx
+source scripts/dev_source.sh
+python3 -u -m yolo_grasp.main
+```
+
+**Do NOT add `source dev_source.sh` to `~/.bashrc`.** The script does
+`$(rbnx path …)` which spawns a child bash; if `.bashrc` re-sources
+the script, every child bash recurses, which manifests as N copies of
+`[yolo_grasp-source] package root: …` in the rbnx-boot log followed
+by a 60s registration timeout (the real `python3 -m yolo_grasp.main`
+never actually runs). The script has a reentrancy guard against this,
+but the right place for it is `source` it on demand from a single
+debugging shell, not your shell init.
+
+`rbnx boot` itself uses `scripts/start.sh`, which has its own
+sourcing chain and doesn't need this helper.
+
 ## Verification (in order)
 
 ```bash
