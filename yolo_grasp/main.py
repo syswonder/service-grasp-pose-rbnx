@@ -126,6 +126,8 @@ _DEFAULT_Z_TABLE        = 0.02    # table height in base_link (m)
 _DEFAULT_Z_OFFSET        = 0.0    # TCP offset below z_table (m)
 _DEFAULT_APPROACH_DIST   = 0.10   # pre/post grasp hover height (m)
 _DEFAULT_YAW_RAD         = 0.0    # default yaw (rad)
+_DEFAULT_RADIAL_YAW      = False  # if True, override yaw with atan2(y,x)
+_DEFAULT_RADIAL_YAW_OFFSET = 0.0  # extra yaw added on top of radial (rad)
 _DEFAULT_BASE_FRAME      = "arm/base_link"
 _DEFAULT_CAMERA_FRAME    = "camera_color_optical_frame"
 _DEFAULT_COLOR_INFO_TOPIC = "/camera/color/camera_info"
@@ -410,6 +412,20 @@ def _compute_grasp(
 
     # ── assemble pose ──
     grasp_z = z_table + z_offset  # TCP height (z_offset < 0 → dip below table)
+
+    # Plan-A wrist-flip mitigation: when `radial_yaw` is enabled, override
+    # the fixed default yaw with atan2(y_base, x_base) (+ optional offset).
+    # Aligning the gripper opening with the radial direction from the arm
+    # base to the target sharply narrows joint6's valid range, so MoveIt's
+    # IK is far less likely to pick the "wrist-flipped" branch (j6 ± π).
+    # `radial_yaw_offset_rad` lets you rotate the opening by e.g. ±π/2
+    # if you want the fingers to close *across* the radius instead of
+    # *along* it.
+    if bool(cfg.get("radial_yaw", _DEFAULT_RADIAL_YAW)):
+        offset = float(cfg.get("radial_yaw_offset_rad",
+                                _DEFAULT_RADIAL_YAW_OFFSET))
+        yaw_rad = float(np.arctan2(y_base, x_base)) + offset
+
     qx, qy, qz, qw = _vertical_quaternion(yaw_rad)
 
     # Score: crude quality proxy based on bbox area (same as before).

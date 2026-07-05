@@ -1,9 +1,19 @@
 # Vertical grasp configuration.
 #
-# Override any of these via the Driver(CMD_INIT, config_json) cfg
-# parameter — keys here are the DEFAULTS, not the only source.
+# ⚠️ THIS FILE IS DOCUMENTATION ONLY — it is NOT read at runtime.
+# main.py takes its config from Driver(CMD_INIT, config_json), which
+# rbnx boot populates from the deploy manifest's `config:` block
+# (e.g. rbnx_piper_packages/robonix_manifest.yaml → yolo_grasp.config).
+# The values below only mirror the hard-coded _DEFAULT_* constants in
+# main.py; editing them changes nothing on a live system. Change the
+# deploy manifest instead.
 vertical_grasp:
-  # Table height in arm/base_link frame (m). Measure once with a ruler.
+  # Table/ground height in arm/base_link frame (m), SIGNED.
+  # Positive = plane above base_link origin; negative = below.
+  # This is the z of the MoveIt planning target (arm/link6 origin)
+  # when the gripper tip just touches the plane — NOT the raw plane
+  # height. Measure with the tip contacting the target surface, then
+  # read `ros2 run tf2_ros tf2_echo arm/base_link arm/link6`.z.
   z_table: 0.02
 
   # TCP offset below z_table (m). Negative = dip below table surface
@@ -18,6 +28,17 @@ vertical_grasp:
   # Default yaw (rad). 0 = gripper aligned with base_link x-axis.
   # If the LLM / VLM outputs an orientation, wire it here in the future.
   default_yaw_rad: 0.0
+
+  # Plan-A wrist-flip mitigation. When true, ignore default_yaw_rad and
+  # use atan2(y_base, x_base) as the grasp yaw so the gripper opening
+  # points radially outward from the arm base. This drastically narrows
+  # the joint6 (wrist rotation) IK branches, preventing MoveIt from
+  # picking the "wrist-flipped" solution (j6 ± π).
+  radial_yaw: false
+  # Extra yaw added on top of the radial direction, in radians. Set to
+  # ±π/2 (≈ ±1.5708) to close the fingers perpendicular to the radius
+  # instead of along it.
+  radial_yaw_offset_rad: 0.0
 
   # Gripper width returned to pick_skill (m). pick_skill overrides this
   # with its own EXEC_GRIPPER_WIDTH=0.04 anyway, so this is advisory.
