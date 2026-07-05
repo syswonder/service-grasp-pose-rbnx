@@ -1,7 +1,13 @@
-# yolo_grasp_rbnx — geometric grasp-pose estimator service.
+# yolo_grasp_rbnx — vertical grasp-pose estimator service.
 #
 # Pure CPU. No ML model, no GPU, no torch. Owns
 # `robonix/service/perception/grasp_pose/*`.
+#
+# Vertical-grasp version: replaces the depth-median back-projection
+# algorithm with a ray-plane intersection (camera ray through bbox
+# center ∩ table plane z=z_table in base_link). The grasp pose is
+# output in arm/base_link with a fixed vertical-down quaternion.
+# Depth is NOT consumed — only RGB camera_info + hand-eye TF are needed.
 #
 # Three roles:
 #   * SERVER (atlas MCP): grasp_pose/grasp_request — Pilot's new path
@@ -22,8 +28,8 @@
 # Lifecycle:
 #   on_init      — light-medium: parse cfg, atlas-resolve detect_object
 #                  endpoint (informational), spawn rclpy thread
-#                  (depth + camera_info + detect_objects subs +
-#                  /graspnet/grasps publisher + service host).
+#                  (depth + camera_info + TF listener + detect_objects
+#                  subs + /graspnet/grasps publisher + service host).
 #   on_deactivate — stop rclpy thread; publish a zero-pose to
 #                   /graspnet/grasps so subscribers see "service stopped".
 #
@@ -33,6 +39,24 @@
 #   service/perception/grasp_pose/grasps         mode=topic_out  transport=ROS2  GraspPose.msg
 #
 # Config (all keys optional; passed via Driver(CMD_INIT, config_json)):
+#
+#   ── vertical grasp parameters ──
+#   z_table                     float       default 0.02  — table height in
+#                                            arm/base_link (m). Ray-plane
+#                                            intersection target.
+#   z_offset                    float       default 0.0   — TCP offset below
+#                                            z_table (m). Negative dips
+#                                            below table surface.
+#   approach_dist               float       default 0.10  — hover height for
+#                                            pre/post grasp (m). Used by
+#                                            pick_skill_rbnx.
+#   default_yaw_rad             float       default 0.0  — yaw rotation about
+#                                            base_link z-axis (rad).
+#   base_frame                  str         default arm/base_link
+#   camera_frame                str         default camera_color_optical_frame
+#   output_frame                str         default arm/base_link — pose output
+#                                            frame (so piper_moveit TF is
+#                                            a no-op).
 #
 #   ── candidate selection (auto-publish stream mode) ──
 #   candidates                  list[str]   default = upstream allowlist of
@@ -47,24 +71,14 @@
 #
 #   ── ROS topic names (only override when atlas resolution fails) ──
 #   depth_topic                 str         default /camera/depth/image_raw
-#   camera_info_topic           str         default /camera/depth/camera_info
+#                                            (not consumed in vertical mode,
+#                                            kept for backward compat)
+#   camera_info_topic           str         default /camera/color/camera_info
 #   detect_objects_topic        str         default /yolo/detect_objects
 #   grasps_topic                str         default /graspnet/grasps
 #
-#   ── geometric estimator knobs ──
-#   median_grid                 int         default 7    — grid size for
-#                                            median depth sampling inside bbox
-#   min_depth_m                 float       default 0.05
-#   max_depth_m                 float       default 3.0
-#   safe_height_m               float       default 0.10 — z subtracted from
-#                                            depth (gripper finishes ABOVE)
-#   gripper_width_default       float       default 0.12 — pre-clamp width
-#   gripper_width_min           float       default 0.0
-#   gripper_width_max           float       default 0.12
-#   orientation_xyzw            list[float] default [-0.1329, 0.1508,
-#                                            -0.6840, -0.7013] — pre-calibrated
-#                                            top-down approach quaternion
-#   output_frame                str         default camera_color_optical_frame
+#   ── legacy geometric estimator knobs (unused in vertical mode) ──
+#   gripper_width_default       float       default 0.04 — returned to caller
 #
 # Vendored:
 #   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
@@ -73,6 +87,7 @@
 #   yolo_grasp/_upstream/yolo_grasp.py — preserved upstream source
 #                        (kept as algorithm reference; main.py is what
 #                        actually runs).
+#   config/vertical_grasp.yaml — default config for vertical mode.
 manifestVersion: 1
 
 package:

@@ -1,0 +1,35 @@
+# Vertical grasp configuration.
+#
+# Override any of these via the Driver(CMD_INIT, config_json) cfg
+# parameter — keys here are the DEFAULTS, not the only source.
+vertical_grasp:
+  # Table height in arm/base_link frame (m). Measure once with a ruler.
+  z_table: 0.02
+
+  # TCP offset below z_table (m). Negative = dip below table surface
+  # (compensates for gripper finger length). 0 = TCP lands exactly on
+  # the table plane.
+  z_offset: 0.0
+
+  # Hover height: pre/post grasp pose is z_table + approach_dist.
+  # Used by pick_skill_rbnx when constructing the three-stage motion.
+  approach_dist: 0.10
+
+  # Default yaw (rad). 0 = gripper aligned with base_link x-axis.
+  # If the LLM / VLM outputs an orientation, wire it here in the future.
+  default_yaw_rad: 0.0
+
+  # Gripper width returned to pick_skill (m). pick_skill overrides this
+  # with its own EXEC_GRIPPER_WIDTH=0.04 anyway, so this is advisory.
+  gripper_width_default: 0.04
+
+  # Hand-eye TF frames.
+  base_frame: "arm/base_link"
+  camera_frame: "camera_color_optical_frame"
+
+  # Camera intrinsics topic (color, not depth).
+  camera_info_topic: "/camera/color/camera_info"
+
+  # Output frame for the grasp pose. arm/base_link so piper_moveit's
+  # internal TF transform becomes a no-op.
+  output_frame: "arm/base_link"

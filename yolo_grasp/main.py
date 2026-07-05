@@ -114,6 +114,22 @@ _DEFAULT_CANDIDATES: list[str] = [
 # (orientation_xyzw) only if you've recalibrated.
 _DEFAULT_QUAT = (-0.1329, 0.1508, -0.6840, -0.7013)
 
+# ── vertical grasp mode constants ───────────────────────────────────────────
+# In vertical mode, the grasp pose is computed by intersecting the camera
+# ray through the bbox center with the table plane (z = z_table in
+# base_link), then writing a fixed vertical-down quaternion. This replaces
+# the depth-median back-projection used in the original algorithm.
+#
+# The pose is output in arm/base_link (not camera_color_optical_frame),
+# so piper_moveit_rbnx's TF transform becomes a no-op.
+_DEFAULT_Z_TABLE        = 0.02    # table height in base_link (m)
+_DEFAULT_Z_OFFSET        = 0.0    # TCP offset below z_table (m)
+_DEFAULT_APPROACH_DIST   = 0.10   # pre/post grasp hover height (m)
+_DEFAULT_YAW_RAD         = 0.0    # default yaw (rad)
+_DEFAULT_BASE_FRAME      = "arm/base_link"
+_DEFAULT_CAMERA_FRAME    = "camera_color_optical_frame"
+_DEFAULT_COLOR_INFO_TOPIC = "/camera/color/camera_info"
+
 # ── shared state ────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 _initialized = False
@@ -142,6 +158,11 @@ _ROS_READY_TIMEOUT_S = 15.0
 # under _state_lock). Both are raw ROS messages, decoded lazily.
 _latest_depth_msg = None         # sensor_msgs/Image
 _latest_cam_info = None          # sensor_msgs/CameraInfo
+
+# Vertical mode: latest T_base_cam (4×4 numpy array) cached by a periodic
+# TF lookup in the rclpy thread. None until the first successful lookup.
+_latest_T_base_cam = None       # numpy 4×4 or None
+_latest_T_stamp_s: float = 0.0  # monotonic time of last successful TF lookup
 
 # Latest /yolo/detect_objects message — cached unconditionally (i.e.
 # even when auto_publish_topic is OFF) so that grasp_request handlers
@@ -247,6 +268,64 @@ def _parse_intrinsics(cam_info) -> tuple[float, float, float, float]:
     return float(K[0]), float(K[4]), float(K[2]), float(K[5])
 
 
+def _pixel_to_table_xy(
+    u: float, v: float,
+    fx: float, fy: float, cx: float, cy: float,
+    T_base_cam, z_table: float,
+) -> tuple[float, float]:
+    """Ray-plane intersection: cast a ray from the camera through pixel
+    (u, v), transform it into base_link, and intersect with the table
+    plane z = z_table.
+
+    Returns (x, y) in base_link frame. Raises ValueError on degenerate
+    cases (ray parallel to table, intersection behind camera).
+    """
+    import numpy as np
+
+    # 1) pixel → camera optical frame unit direction
+    d_cam = np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
+    d_cam /= np.linalg.norm(d_cam)
+
+    # 2) rotate ray into base_link; origin = camera position in base_link
+    R_bc = T_base_cam[:3, :3]
+    t_bc = T_base_cam[:3, 3]
+    d_base = R_bc @ d_cam
+    o_base = t_bc
+
+    # 3) intersect with plane z = z_table
+    if abs(d_base[2]) < 1e-6:
+        raise ValueError("camera ray is parallel to table plane")
+    t_param = (z_table - o_base[2]) / d_base[2]
+    if t_param <= 0:
+        raise ValueError("intersection is behind camera")
+    p_base = o_base + t_param * d_base
+    return float(p_base[0]), float(p_base[1])
+
+
+def _vertical_quaternion(yaw_rad: float):
+    """Quaternion for a vertical-down grasp (end-effector z-axis
+    pointing at world -z), with an optional yaw rotation about the
+    world z-axis.
+
+    Returns (qx, qy, qz, qw).
+    """
+    import numpy as np
+    # Euler roll=pi, pitch=0, yaw=yaw_rad in 'sxyz' convention.
+    # roll=pi flips the end-effector so it points down.
+    cr = np.cos(np.pi / 2)
+    sr = np.sin(np.pi / 2)
+    cp = 1.0  # cos(0)
+    sp = 0.0  # sin(0)
+    cy = np.cos(yaw_rad / 2)
+    sy = np.sin(yaw_rad / 2)
+    # quaternion_from_euler(pi, 0, yaw, 'sxyz') expanded:
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    qw = cr * cp * cy + sr * sp * sy
+    return float(qx), float(qy), float(qz), float(qw)
+
+
 def _compute_grasp(
     *,
     bbox_2d: list[float],
@@ -255,8 +334,17 @@ def _compute_grasp(
     cfg: dict[str, Any],
     object_name: str = "",
 ) -> dict:
-    """Pure geometric grasp computation. The math kernel shared by
-    all three surfaces (MCP RPC, ROS service, auto-publish stream).
+    """Geometric grasp computation — vertical-grasp version.
+
+    Instead of depth-median back-projection, this casts a ray from the
+    camera through the bbox center pixel, transforms it into base_link
+    via the hand-eye-calibrated TF, and intersects it with the table
+    plane (z = z_table). The pose is output in arm/base_link with a
+    fixed vertical-down quaternion.
+
+    depth_msg is accepted but **ignored** in vertical mode — kept in
+    the signature for backward compatibility with callers that still
+    pass it.
 
     Returns the same dict shape regardless of success/failure:
         {
@@ -271,11 +359,11 @@ def _compute_grasp(
     """
     import numpy as np
 
-    output_frame = cfg.get("output_frame", "camera_color_optical_frame")
-    safe_height_m = float(cfg.get("safe_height_m", 0.10))
-    quat = tuple(cfg.get("orientation_xyzw") or _DEFAULT_QUAT)
-    if len(quat) != 4:
-        quat = _DEFAULT_QUAT
+    output_frame = cfg.get("output_frame", _DEFAULT_BASE_FRAME)
+    z_table      = float(cfg.get("z_table",       _DEFAULT_Z_TABLE))
+    z_offset     = float(cfg.get("z_offset",      _DEFAULT_Z_OFFSET))
+    yaw_rad      = float(cfg.get("default_yaw_rad", _DEFAULT_YAW_RAD))
+    width        = float(cfg.get("gripper_width_default", 0.04))
 
     fail = lambda msg: {  # noqa: E731
         "success": False, "message": msg,
@@ -285,66 +373,65 @@ def _compute_grasp(
         "gripper_width": 0.0, "score": 0.0,
     }
 
-    if depth_msg is None:
-        return fail("no depth frame received yet")
     if cam_info is None:
         return fail("no camera_info received yet")
     if not bbox_2d or len(bbox_2d) != 4:
         return fail(f"bbox_2d must be length 4, got {bbox_2d!r}")
 
+    # ── read cached TF (base_link ← camera_color_optical_frame) ──
+    with _state_lock:
+        T_base_cam = _latest_T_base_cam
+        T_age_s    = time.monotonic() - _latest_T_stamp_s if _latest_T_stamp_s else 999.0
+
+    if T_base_cam is None:
+        return fail(
+            "no TF transform cached yet (arm/base_link ← "
+            "camera_color_optical_frame). Is easy_handeye2_rbnx "
+            "publishing the hand-eye TF?")
+    if T_age_s > 5.0:
+        log.warning("TF cache is %.1fs old — hand-eye TF may be stale", T_age_s)
+
+    # ── bbox center pixel ──
     x_min, y_min, x_max, y_max = (float(v) for v in bbox_2d)
     u = 0.5 * (x_min + x_max)
     v_pix = 0.5 * (y_min + y_max)
 
-    depth_m = _depth_to_numpy(depth_msg)
-    if depth_m is None:
-        return fail(f"unsupported depth encoding: {depth_msg.encoding}")
-
-    z_m = _depth_median_in_bbox(
-        depth_m, (x_min, y_min, x_max, y_max),
-        grid       = int(cfg.get("median_grid",  7)),
-        min_depth  = float(cfg.get("min_depth_m", 0.05)),
-        max_depth  = float(cfg.get("max_depth_m", 3.0)),
-    )
-    if z_m is None:
-        return fail(
-            f"no valid depth in bbox {bbox_2d} (range "
-            f"{cfg.get('min_depth_m', 0.05)}..{cfg.get('max_depth_m', 3.0)} m)")
-
+    # ── camera intrinsics ──
     fx, fy, cx, cy = _parse_intrinsics(cam_info)
     if fx <= 0.0 or fy <= 0.0:
         return fail(f"invalid intrinsics fx={fx} fy={fy}")
 
-    # Pinhole back-projection in optical frame.
-    px = (u     - cx) * z_m / fx
-    py = (v_pix - cy) * z_m / fy
-    pz = z_m - safe_height_m  # safe height: gripper finishes ABOVE the object
+    # ── ray-plane intersection ──
+    try:
+        x_base, y_base = _pixel_to_table_xy(
+            u, v_pix, fx, fy, cx, cy, T_base_cam, z_table)
+    except ValueError as e:
+        return fail(f"ray-plane intersection failed: {e}")
 
-    # Gripper width: upstream literally hardcoded 0.12 m, but the
-    # config-clamp shape is preserved so a future deploy can wire
-    # "narrower for small bboxes" without changing this code.
-    width = float(cfg.get("gripper_width_default", 0.12))
-    width = float(np.clip(
-        width,
-        float(cfg.get("gripper_width_min", 0.0)),
-        float(cfg.get("gripper_width_max", 0.12)),
-    ))
+    # ── assemble pose ──
+    grasp_z = z_table + z_offset  # TCP height (z_offset < 0 → dip below table)
+    qx, qy, qz, qw = _vertical_quaternion(yaw_rad)
 
-    # Score: a crude quality proxy = depth validity * bbox-coverage.
-    # Used by Stage 6 pick_skill to decide whether to retry.
+    # Score: crude quality proxy based on bbox area (same as before).
     bbox_area = max(0.0, (x_max - x_min)) * max(0.0, (y_max - y_min))
-    h_img, w_img = depth_m.shape[:2]
-    rel_area = bbox_area / max(1.0, float(h_img * w_img))
-    score = max(0.0, min(1.0, 0.5 + 0.5 * rel_area))
+    # We don't have image dims here without depth_msg, so just use
+    # a flat 0.8 default — the score is advisory only.
+    score = 0.8
+
+    log.info(
+        "vertical grasp: object=%r uv=(%.1f,%.1f) → base_link "
+        "(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
+        object_name, u, v_pix, x_base, y_base, grasp_z, yaw_rad)
 
     return {
         "success":       True,
         "message":       f"ok (object={object_name!r}, "
-                         f"u,v=({u:.1f},{v_pix:.1f}), z={z_m:.3f}m)",
+                         f"u,v=({u:.1f},{v_pix:.1f}), "
+                         f"base_xy=({x_base:.3f},{y_base:.3f}))",
         "pose": {
-            "position":    {"x": float(px), "y": float(py), "z": float(pz)},
-            "orientation": {"x": float(quat[0]), "y": float(quat[1]),
-                            "z": float(quat[2]), "w": float(quat[3])},
+            "position":    {"x": float(x_base), "y": float(y_base),
+                            "z": float(grasp_z)},
+            "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
         },
         "frame_id":      output_frame,
         "gripper_width": float(width),
@@ -366,6 +453,7 @@ def _ros_thread_main() -> None:
     """
     global _ros_node, _grasps_pub
     global _latest_depth_msg, _latest_cam_info
+    global _latest_T_base_cam, _latest_T_stamp_s
     global _ros_thread_error
 
     node = None
@@ -377,6 +465,8 @@ def _ros_thread_main() -> None:
         from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
         from graspnet_msgs.msg import DetectedObjects             # noqa: E402
         from cv_bridge import CvBridge                            # noqa: E402
+        import tf2_ros                                            # noqa: E402
+        import numpy as np                                        # noqa: E402
 
         # cv_bridge instance attached to the helper for cheap reuse
         _depth_to_numpy._bridge = CvBridge()  # type: ignore[attr-defined]
@@ -388,14 +478,22 @@ def _ros_thread_main() -> None:
         cfg = _resolved_cfg
 
         depth_topic    = str(cfg.get("depth_topic",          "/camera/depth/image_raw"))
-        cam_info_topic = str(cfg.get("camera_info_topic",    "/camera/depth/camera_info"))
+        cam_info_topic = str(cfg.get("camera_info_topic",    _DEFAULT_COLOR_INFO_TOPIC))
         det_topic      = str(cfg.get("detect_objects_topic", "/yolo/detect_objects"))
         grasps_topic   = str(cfg.get("grasps_topic",         "/graspnet/grasps"))
+
+        base_frame   = str(cfg.get("base_frame",   _DEFAULT_BASE_FRAME))
+        camera_frame = str(cfg.get("camera_frame", _DEFAULT_CAMERA_FRAME))
 
         # Subscribers — feed the latest depth / camera_info into shared
         # state. We deliberately keep only the most recent message; older
         # ones are dropped because grasp_request is always "use what's
         # current right now". qos depth=10 mirrors upstream.
+        #
+        # NOTE: In vertical mode, depth is NOT consumed by _compute_grasp
+        # (ray-plane intersection replaces depth back-projection). The
+        # subscription is kept for backward compatibility / auto-publish
+        # stream mode which still needs it.
         def _on_depth(msg):
             global _latest_depth_msg
             with _state_lock:
@@ -409,6 +507,41 @@ def _ros_thread_main() -> None:
         node.create_subscription(Image,      depth_topic,    _on_depth,    10)
         node.create_subscription(CameraInfo, cam_info_topic, _on_cam_info, 10)
         log.info("subscribing depth=%s camera_info=%s", depth_topic, cam_info_topic)
+
+        # ── TF: cache T_base_cam periodically for the vertical grasp
+        # ray-plane intersection. The hand-eye TF (base_link ←
+        # camera_color_optical_frame) is published by easy_handeye2_rbnx.
+        # We poll it every 0.5s in the spin loop below; _compute_grasp
+        # reads the cached 4×4 matrix from shared state. ──
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer, node)
+        log.info("TF listener ready: %s ← %s", base_frame, camera_frame)
+
+        def _poll_tf():
+            """Look up base_link ← camera TF and cache the 4×4 matrix."""
+            global _latest_T_base_cam, _latest_T_stamp_s
+            try:
+                tfm = tf_buffer.lookup_transform(
+                    base_frame, camera_frame,
+                    rclpy.time.Time(),  # latest available
+                    timeout=rclpy.duration.Duration(seconds=0.05))
+            except Exception:  # noqa: BLE001
+                return  # transform not yet available — will retry next tick
+            t = tfm.transform.translation
+            r = tfm.transform.rotation
+            # quaternion → rotation matrix
+            qx, qy, qz, qw = r.x, r.y, r.z, r.w
+            R = np.array([
+                [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),   2*(qx*qz + qy*qw)],
+                [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+                [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),   1 - 2*(qx*qx + qy*qy)],
+            ])
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3]  = [t.x, t.y, t.z]
+            with _state_lock:
+                _latest_T_base_cam = T
+                _latest_T_stamp_s  = time.monotonic()
 
         # Publisher — C++ piper_moveit_control + every other downstream.
         _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
@@ -512,9 +645,15 @@ def _ros_thread_main() -> None:
 
     # Spin until shutdown.
     import rclpy  # noqa: E402  (re-import for the spin loop scope)
+    _tf_poll_timer = 0.0
     while not _ros_stop_evt.is_set():
         try:
             rclpy.spin_once(node, timeout_sec=0.1)
+            # Poll TF every ~0.5s (10 spin iterations at 0.1s each).
+            _tf_poll_timer += 0.1
+            if _tf_poll_timer >= 0.5:
+                _tf_poll_timer = 0.0
+                _poll_tf()
         except Exception as e:  # noqa: BLE001
             # Per-iteration errors should NOT bring the whole thread down
             # — that would silently re-introduce the "alive but mute"
