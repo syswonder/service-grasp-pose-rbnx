@@ -100,12 +100,13 @@ grasp:
 1. Take the bbox center pixel `(u, v) = ((x_min+x_max)/2, (y_min+y_max)/2)`.
 2. Project `[u, v, 1]` through the required 3x3 homography matrix to
    get arm-plane `(x, y)`, same as roboarm `Arm.pixel2pos`.
-3. Compute gripper yaw from the bbox long edge, same as roboarm
+3. Apply a global XY bias (`bias_x`, `bias_y`) after homography.
+4. Compute gripper yaw from the bbox long edge, same as roboarm
    `Arm.gripper_angle_by_longer`.
-4. Shift the grasp point by `catch_offset`:
+5. Shift the grasp point by `catch_offset`:
    `x += offset * cos(yaw)` and `y += offset * sin(-yaw)`.
-5. Use `default_desktop_height` as the final grasp z.
-6. Output a vertical-down pose in `arm/base_link`.
+6. Use `default_desktop_height` as the final grasp z.
+7. Output a vertical-down pose in `arm/base_link`.
 
 Depth, camera intrinsics, and hand-eye TF are not used. If the
 homography or desktop height is missing, `on_init` fails.
@@ -197,7 +198,9 @@ config:
   #   - [0.0, 1.0, 0.0]
   #   - [0.0, 0.0, 1.0]
   default_desktop_height: 0.075
-  catch_offset:           0.01
+  bias_x:                 0.0           # global X correction after homography
+  bias_y:                 0.0           # global Y correction after homography
+  catch_offset:           0.01          # local offset along gripper yaw
   box_rotation_deg:       0.0
   gripper_width_default:  0.04
   output_frame:           arm/base_link

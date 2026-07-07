@@ -24,6 +24,11 @@ roboarm_grasp:
   # catch_offset along the computed gripper yaw.
   catch_offset: 0.01
 
+  # Global XY bias applied after homography and before catch_offset.
+  # Positive / negative directions follow the output_frame axes.
+  bias_x: 0.0
+  bias_y: 0.0
+
   # If bbox_2d has only [x_min, y_min, x_max, y_max], this rotation is
   # used when computing roboarm's long-edge gripper yaw. If a future
   # detector passes bbox_2d length 5, the fifth value overrides this.

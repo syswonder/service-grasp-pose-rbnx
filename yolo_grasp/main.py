@@ -118,6 +118,8 @@ _DEFAULT_CANDIDATES: list[str] = [
 _DEFAULT_CATCH_OFFSET   = 0.01    # meters
 _DEFAULT_BOX_ROTATION_DEG = 0.0
 _DEFAULT_APPROACH_DIST   = 0.10   # pre/post grasp hover height (m)
+_DEFAULT_BIAS_X          = 0.0    # meters, global XY correction after homography
+_DEFAULT_BIAS_Y          = 0.0    # meters, global XY correction after homography
 _DEFAULT_BASE_FRAME      = "arm/base_link"
 
 # ── shared state ────────────────────────────────────────────────────────────
@@ -326,6 +328,13 @@ def _gripper_angle_by_longer(
     return float(gripper_rot_rad)
 
 
+def _apply_xy_bias(x: float, y: float, cfg: dict[str, Any]) -> tuple[float, float]:
+    """Apply a global XY translation after homography and before catch_offset."""
+    bias_x = float(cfg.get("bias_x", _DEFAULT_BIAS_X))
+    bias_y = float(cfg.get("bias_y", _DEFAULT_BIAS_Y))
+    return x + bias_x, y + bias_y
+
+
 def _compute_grasp(
     *,
     bbox_2d: list[float],
@@ -396,15 +405,18 @@ def _compute_grasp(
         return fail(f"bbox has non-positive size: {bbox_2d!r}")
 
     try:
-        target_x, target_y = _pixel_to_arm_xy(u, v_pix)
+        raw_x, raw_y = _pixel_to_arm_xy(u, v_pix)
+        target_x, target_y = _apply_xy_bias(raw_x, raw_y, cfg)
     except ValueError as e:
         return fail(f"pixel2pos failed: {e}")
 
     yaw_rad = _gripper_angle_by_longer(
         u, v_pix, bbox_w, bbox_h, box_rotation_deg
     )
-    grasp_x = target_x + catch_offset * math.cos(yaw_rad)
-    grasp_y = target_y + catch_offset * math.sin(-yaw_rad)
+    catch_dx = catch_offset * math.cos(yaw_rad)
+    catch_dy = catch_offset * math.sin(-yaw_rad)
+    grasp_x = target_x + catch_dx
+    grasp_y = target_y + catch_dy
     qx, qy, qz, qw = _vertical_quaternion(yaw_rad)
 
     # Score: crude quality proxy based on bbox area (same as before).
@@ -413,13 +425,15 @@ def _compute_grasp(
     # a flat 0.8 default — the score is advisory only.
     score = 0.8
 
+    bias_x = float(cfg.get("bias_x", _DEFAULT_BIAS_X))
+    bias_y = float(cfg.get("bias_y", _DEFAULT_BIAS_Y))
     log.info(
         "roboarm grasp: object=%r uv=(%.1f,%.1f) bbox=(%.1fx%.1f, rot=%.1f) "
-        "pixel2pos=(x=%.3f, y=%.3f) offset=%.3f -> "
-        "grasp=(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
+        "raw_xy=(x=%.3f, y=%.3f) bias=(%.3f, %.3f) biased_xy=(x=%.3f, y=%.3f) "
+        "catch_offset=(dx=%.3f, dy=%.3f) -> grasp=(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
         object_name, u, v_pix, bbox_w, bbox_h, box_rotation_deg,
-        target_x, target_y, catch_offset, grasp_x, grasp_y,
-        desktop_height, yaw_rad)
+        raw_x, raw_y, bias_x, bias_y, target_x, target_y,
+        catch_dx, catch_dy, grasp_x, grasp_y, desktop_height, yaw_rad)
 
     return {
         "success":       True,
