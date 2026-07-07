@@ -92,33 +92,23 @@ thread, log a warning if it never appears, and let `grasp_request`
 calls without a bbox fail cleanly afterwards. This keeps boot from
 deadlocking when yolo_world_rbnx is still warming up.
 
-## Algorithm (geometric estimator)
+## Algorithm (roboarm estimator)
 
-The math is a direct port of the upstream `detect_grasp/yolo_grasp.py`,
-preserved at `yolo_grasp/_upstream/yolo_grasp.py` for reference. Per
+The math is a direct port of `~/lhw/roboarm`'s LLM grasp path. Per
 grasp:
 
 1. Take the bbox center pixel `(u, v) = ((x_min+x_max)/2, (y_min+y_max)/2)`.
-2. Sample a `median_grid x median_grid` lattice (default 7×7) of depth
-   pixels inside the bbox. Keep only depths in `[min_depth_m, max_depth_m]`
-   (default `[0.05, 3.0]` m). Take the median.
-3. Back-project `(u, v, z)` through the pinhole intrinsics from
-   `camera_info` (`fx, fy, cx, cy` from `K`):
-   `x = (u - cx) * z / fx;   y = (v - cy) * z / fy`.
-4. Subtract `safe_height_m` (default 0.10 m) from z so the gripper
-   ends ABOVE the object. The MoveIt cartesian descent finishes the
-   last 10 cm.
-5. Orientation = a pre-calibrated approach quaternion
-   `[-0.1329, 0.1508, -0.6840, -0.7013]` (override via
-   `cfg.orientation_xyzw`). Upstream doesn't estimate orientation
-   from geometry — it reuses one fixed top-down approach.
-6. Gripper width = `clamp(0.12, gripper_width_min, gripper_width_max)`,
-   default 0.12 m everywhere — also a fixed value upstream.
+2. Project `[u, v, 1]` through the required 3x3 homography matrix to
+   get arm-plane `(x, y)`, same as roboarm `Arm.pixel2pos`.
+3. Compute gripper yaw from the bbox long edge, same as roboarm
+   `Arm.gripper_angle_by_longer`.
+4. Shift the grasp point by `catch_offset`:
+   `x += offset * cos(yaw)` and `y += offset * sin(-yaw)`.
+5. Use `default_desktop_height` as the final grasp z.
+6. Output a vertical-down pose in `arm/base_link`.
 
-The output frame is `camera_color_optical_frame`. Stage 3B
-`easy_handeye2_rbnx` publishes the `link6 → camera_color_optical_frame`
-static TF, so Stage 5 piper_moveit can transform the pose to base_link
-without any extra plumbing.
+Depth, camera intrinsics, and hand-eye TF are not used. If the
+homography or desktop height is missing, `on_init` fails.
 
 ### Score (heuristic)
 
@@ -177,7 +167,10 @@ Both are one-shot — one call ⇒ at most one grasp. No background stream.
 
 ## Configuration
 
-All keys are optional. Defaults are listed in the comment after each.
+`hand_eye_calibration_file` (or inline `homography_matrix`) and
+`default_desktop_height` are required. The estimator intentionally uses
+the same 2D homography + long-edge yaw + catch offset strategy as
+`~/lhw/roboarm`; it does not use depth, camera intrinsics, or TF.
 
 ```yaml
 config:
@@ -192,22 +185,22 @@ config:
     - monitor
     # ...etc; see _DEFAULT_CANDIDATES in main.py for full list
 
-  # ROS topic names (only override when atlas resolution fails) ──
-  depth_topic:          /camera/depth/image_raw
-  camera_info_topic:    /camera/depth/camera_info
+  # ROS topic names ─────────────────────────────────────────────
   detect_objects_topic: /yolo/detect_objects
   grasps_topic:         /graspnet/grasps
 
-  # Geometric estimator knobs ───────────────────────────────────
-  median_grid:           7
-  min_depth_m:           0.05
-  max_depth_m:           3.0
-  safe_height_m:         0.10              # subtract from z
-  gripper_width_default: 0.12              # pre-clamp width
-  gripper_width_min:     0.0
-  gripper_width_max:     0.12
-  orientation_xyzw:      [-0.1329, 0.1508, -0.6840, -0.7013]
-  output_frame:          camera_color_optical_frame
+  # Roboarm-style estimator knobs ───────────────────────────────
+  hand_eye_calibration_file: /absolute/path/to/2d_homography.npy
+  # or:
+  # homography_matrix:
+  #   - [1.0, 0.0, 0.0]
+  #   - [0.0, 1.0, 0.0]
+  #   - [0.0, 0.0, 1.0]
+  default_desktop_height: 0.075
+  catch_offset:           0.01
+  box_rotation_deg:       0.0
+  gripper_width_default:  0.04
+  output_frame:           arm/base_link
 ```
 
 ## What was removed from upstream
@@ -291,8 +284,9 @@ ros2 topic echo /graspnet/grasps --once
 
 | symptom | cause | fix |
 |---|---|---|
-| `grasp_request` returns `success=false, message="no depth frame received yet"` | Camera primitive not active, or `depth_topic` mismatch | Check `rbnx caps orbbec_camera` is ACTIVE; verify topic with `ros2 topic hz $depth_topic` |
-| `grasp_request` returns `success=false, message="no valid depth in bbox …"` | Object outside [min_depth_m, max_depth_m], or all-zero depth (camera not warmed up / occlusion) | Widen `max_depth_m` cfg, or increase `median_grid` for more samples |
+| `bad roboarm homography config: missing required ...` | `hand_eye_calibration_file` / `homography_matrix` not configured | Add a real 3x3 pixel-to-arm-plane homography to `yolo_grasp.config` |
+| `bad roboarm homography config: hand_eye_calibration_file does not exist ...` | Config points at a missing `.npy` | Put the calibrated `.npy` on disk and update the path |
+| `missing required roboarm config: default_desktop_height` | Grasp z is not configured | Add the measured tabletop/grasp z in meters |
 | `auto_publish: no candidate match in detections` (debug log) | None of the YOLOE detections are in `cfg.candidates` | Add the actual class name to `cfg.candidates`, or change YOLO prompts |
 | `detect_object pre-call failed: service not advertised` | yolo_world_rbnx not active (only matters for RPC path without bbox) | Check `rbnx caps yolo_world`; ensure Stage 4A is up first |
 | MCP path returns "ROS thread not initialized" | on_init not yet completed | rbnx boot reports the actual blocker; check the package log |

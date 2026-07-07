@@ -3,14 +3,14 @@
 # robonix/service/perception/object_detect/detect_object to localise
 # the target if bbox_2d / object_center_3d are empty.
 #
-# Vertical-grasp version: instead of depth-median back-projection, the
-# handler casts a ray from the camera through the bbox center pixel,
-# transforms it into arm/base_link via the hand-eye-calibrated TF
-# (easy_handeye2_rbnx), and intersects it with the table plane
-# (z = z_table). The pose is output in arm/base_link with a fixed
-# vertical-down quaternion (roll=pi, pitch=0, yaw=configurable).
+# Roboarm-style version: the handler projects the bbox center pixel to
+# arm-plane XY through a required 3x3 2D homography, derives gripper yaw
+# from the bbox long edge, applies catch_offset to the final grasp point,
+# and outputs a vertical-down pose in arm/base_link at
+# default_desktop_height.
 #
-# Depth is NOT consumed — the object_center_3d field is advisory only.
+# Depth / camera_info / TF are NOT consumed — the object_center_3d field
+# is advisory only.
 #
 # IDL: lib/grasp/srv/GraspRequest.srv (package-local). Schema is
 # bytes-compatible with upstream graspnet_msgs/srv/GraspRequest.srv,

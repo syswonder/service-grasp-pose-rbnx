@@ -1,56 +1,40 @@
-# Vertical grasp configuration.
+# Roboarm-style grasp configuration.
 #
-# ⚠️ THIS FILE IS DOCUMENTATION ONLY — it is NOT read at runtime.
-# main.py takes its config from Driver(CMD_INIT, config_json), which
-# rbnx boot populates from the deploy manifest's `config:` block
-# (e.g. rbnx_piper_packages/robonix_manifest.yaml → yolo_grasp.config).
-# The values below only mirror the hard-coded _DEFAULT_* constants in
-# main.py; editing them changes nothing on a live system. Change the
-# deploy manifest instead.
-vertical_grasp:
-  # Table/ground height in arm/base_link frame (m), SIGNED.
-  # Positive = plane above base_link origin; negative = below.
-  # This is the z of the MoveIt planning target (arm/link6 origin)
-  # when the gripper tip just touches the plane — NOT the raw plane
-  # height. Measure with the tip contacting the target surface, then
-  # read `ros2 run tf2_ros tf2_echo arm/base_link arm/link6`.z.
-  z_table: 0.02
+# NOTE: This file is documentation only. Runtime config comes from the
+# deploy manifest's yolo_grasp.config block.
+#
+# The filename is kept for compatibility with older notes, but the
+# algorithm is no longer the old vertical ray-plane implementation.
+roboarm_grasp:
+  # REQUIRED. Path to roboarm's 3x3 2D homography .npy file, mapping
+  # image pixel [u, v, 1] to arm-plane [x, y, 1].
+  hand_eye_calibration_file: /absolute/path/to/2d_homography.npy
 
-  # TCP offset below z_table (m). Negative = dip below table surface
-  # (compensates for gripper finger length). 0 = TCP lands exactly on
-  # the table plane.
-  z_offset: 0.0
+  # Alternative to hand_eye_calibration_file:
+  # homography_matrix:
+  #   - [1.0, 0.0, 0.0]
+  #   - [0.0, 1.0, 0.0]
+  #   - [0.0, 0.0, 1.0]
 
-  # Hover height: pre/post grasp pose is z_table + approach_dist.
-  # Used by pick_skill_rbnx when constructing the three-stage motion.
-  approach_dist: 0.10
+  # REQUIRED. Same meaning as roboarm config.yaml default_desktop_height.
+  # This is the final grasp z in arm/base_link, in meters.
+  default_desktop_height: 0.075
 
-  # Default yaw (rad). 0 = gripper aligned with base_link x-axis.
-  # If the LLM / VLM outputs an orientation, wire it here in the future.
-  default_yaw_rad: 0.0
+  # Same meaning as roboarm catch_offset. The grasp XY is shifted by
+  # catch_offset along the computed gripper yaw.
+  catch_offset: 0.01
 
-  # Plan-A wrist-flip mitigation. When true, ignore default_yaw_rad and
-  # use atan2(y_base, x_base) as the grasp yaw so the gripper opening
-  # points radially outward from the arm base. This drastically narrows
-  # the joint6 (wrist rotation) IK branches, preventing MoveIt from
-  # picking the "wrist-flipped" solution (j6 ± π).
-  radial_yaw: false
-  # Extra yaw added on top of the radial direction, in radians. Set to
-  # ±π/2 (≈ ±1.5708) to close the fingers perpendicular to the radius
-  # instead of along it.
-  radial_yaw_offset_rad: 0.0
+  # If bbox_2d has only [x_min, y_min, x_max, y_max], this rotation is
+  # used when computing roboarm's long-edge gripper yaw. If a future
+  # detector passes bbox_2d length 5, the fifth value overrides this.
+  box_rotation_deg: 0.0
 
-  # Gripper width returned to pick_skill (m). pick_skill overrides this
-  # with its own EXEC_GRIPPER_WIDTH=0.04 anyway, so this is advisory.
+  # Pose output frame consumed by piper_moveit.
+  output_frame: arm/base_link
+
+  # Returned to callers as advisory grasp width. pick_skill currently
+  # controls open/close widths for the three-stage motion.
   gripper_width_default: 0.04
 
-  # Hand-eye TF frames.
-  base_frame: "arm/base_link"
-  camera_frame: "camera_color_optical_frame"
-
-  # Camera intrinsics topic (color, not depth).
-  camera_info_topic: "/camera/color/camera_info"
-
-  # Output frame for the grasp pose. arm/base_link so piper_moveit's
-  # internal TF transform becomes a no-op.
-  output_frame: "arm/base_link"
+  # pick_skill's hover height. Kept here for operator reference.
+  approach_dist: 0.10

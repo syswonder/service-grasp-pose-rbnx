@@ -1,13 +1,14 @@
-# yolo_grasp_rbnx — vertical grasp-pose estimator service.
+# yolo_grasp_rbnx — roboarm-style grasp-pose estimator service.
 #
 # Pure CPU. No ML model, no GPU, no torch. Owns
 # `robonix/service/perception/grasp_pose/*`.
 #
-# Vertical-grasp version: replaces the depth-median back-projection
-# algorithm with a ray-plane intersection (camera ray through bbox
-# center ∩ table plane z=z_table in base_link). The grasp pose is
-# output in arm/base_link with a fixed vertical-down quaternion.
-# Depth is NOT consumed — only RGB camera_info + hand-eye TF are needed.
+# Roboarm-style version: bbox center pixel is mapped to arm-plane XY
+# through a required 3x3 2D hand-eye homography, gripper yaw is derived
+# from the bbox long edge, and catch_offset is applied to the final
+# grasp point. Depth, camera intrinsics, and hand-eye TF are NOT used
+# by the algorithm. Missing homography / desktop height is a hard init
+# error; there is no fallback to the previous ray-plane implementation.
 #
 # Three roles:
 #   * SERVER (atlas MCP): grasp_pose/grasp_request — Pilot's new path
@@ -27,9 +28,9 @@
 #
 # Lifecycle:
 #   on_init      — light-medium: parse cfg, atlas-resolve detect_object
-#                  endpoint (informational), spawn rclpy thread
-#                  (depth + camera_info + TF listener + detect_objects
-#                  subs + /graspnet/grasps publisher + service host).
+#                  endpoint (informational), load homography, spawn rclpy
+#                  thread (detect_objects sub + /graspnet/grasps publisher
+#                  + service host).
 #   on_deactivate — stop rclpy thread; publish a zero-pose to
 #                   /graspnet/grasps so subscribers see "service stopped".
 #
@@ -38,25 +39,25 @@
 #   service/perception/grasp_pose/grasp_request  mode=rpc        transport=MCP   GraspRequest.srv
 #   service/perception/grasp_pose/grasps         mode=topic_out  transport=ROS2  GraspPose.msg
 #
-# Config (all keys optional; passed via Driver(CMD_INIT, config_json)):
+# Config (passed via Driver(CMD_INIT, config_json)):
 #
-#   ── vertical grasp parameters ──
-#   z_table                     float       default 0.02  — table height in
-#                                            arm/base_link (m). Ray-plane
-#                                            intersection target.
-#   z_offset                    float       default 0.0   — TCP offset below
-#                                            z_table (m). Negative dips
-#                                            below table surface.
+#   ── REQUIRED roboarm grasp parameters ──
+#   hand_eye_calibration_file   str         path to 3x3 .npy homography
+#                                            mapping pixel [u,v,1] to
+#                                            arm-plane [x,y,1].
+#   homography_matrix           float[3][3] inline alternative to file.
+#   default_desktop_height      float       final grasp z in arm/base_link.
+#
+#   ── Optional roboarm grasp parameters ──
+#   catch_offset                float       default 0.01 — XY offset along
+#                                            computed gripper yaw.
+#   box_rotation_deg            float       default 0.0 — used when bbox_2d
+#                                            has no fifth rotation element.
 #   approach_dist               float       default 0.10  — hover height for
 #                                            pre/post grasp (m). Used by
 #                                            pick_skill_rbnx.
-#   default_yaw_rad             float       default 0.0  — yaw rotation about
-#                                            base_link z-axis (rad).
-#   base_frame                  str         default arm/base_link
-#   camera_frame                str         default camera_color_optical_frame
 #   output_frame                str         default arm/base_link — pose output
-#                                            frame (so piper_moveit TF is
-#                                            a no-op).
+#                                            frame consumed by piper_moveit.
 #
 #   ── candidate selection (auto-publish stream mode) ──
 #   candidates                  list[str]   default = upstream allowlist of
@@ -69,15 +70,13 @@
 #   auto_publish_min_interval_s float       default 0.0   — rate limit (s).
 #                                            0 means publish every detection.
 #
-#   ── ROS topic names (only override when atlas resolution fails) ──
+#   ── ROS topic names (compat surfaces) ──
 #   depth_topic                 str         default /camera/depth/image_raw
-#                                            (not consumed in vertical mode,
-#                                            kept for backward compat)
-#   camera_info_topic           str         default /camera/color/camera_info
+#                                            (not consumed; kept for compat)
 #   detect_objects_topic        str         default /yolo/detect_objects
 #   grasps_topic                str         default /graspnet/grasps
 #
-#   ── legacy geometric estimator knobs (unused in vertical mode) ──
+#   ── Output knobs ──
 #   gripper_width_default       float       default 0.04 — returned to caller
 #
 # Vendored:
@@ -87,7 +86,7 @@
 #   yolo_grasp/_upstream/yolo_grasp.py — preserved upstream source
 #                        (kept as algorithm reference; main.py is what
 #                        actually runs).
-#   config/vertical_grasp.yaml — default config for vertical mode.
+#   config/vertical_grasp.yaml — config notes; filename kept for compatibility.
 manifestVersion: 1
 
 package:

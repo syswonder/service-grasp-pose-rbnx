@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MulanPSL-2.0
-"""yolo_grasp_rbnx — geometric grasp-pose estimator service.
+"""yolo_grasp_rbnx — roboarm-style grasp-pose estimator service.
 
-Owns ``robonix/service/perception/grasp_pose/*``. Pure CPU — no ML
-model. Implements the geometric / heuristic logic from the live
-upstream pipeline (``detect_grasp/yolo_grasp.py``):
+Owns ``robonix/service/perception/grasp_pose/*``. Pure CPU, no ML model.
+The core math intentionally follows ``~/lhw/roboarm`` rather than the
+previous vertical-grasp implementation:
 
-  * given a YOLO 2D bounding box on the RGB frame, take the bbox
-    center pixel, sample a median depth value from a grid inside
-    the bbox, then back-project the (u, v, z) tuple through the
-    camera intrinsics K into the camera optical frame.
-  * write a pre-calibrated approach quaternion onto that 3D point
-    (the orientation is constant — the live pipeline doesn't try
-    to estimate orientation from geometry, it reuses a single
-    standard top-down approach with a slight tilt).
-  * subtract a small "safe height" from z so the gripper finishes
-    ABOVE the object (the moveit cartesian descent finishes the
-    last 10 cm).
-  * gripper width is clamped to [min, max] from config (default
-    [0.0, 0.12] m) — upstream literally hardcodes 0.12.
+  * take the LLM / detector bbox center pixel.
+  * project it to arm-plane XY through a required 3x3 2D hand-eye
+    homography (same idea as roboarm ``Arm.pixel2pos``).
+  * estimate gripper yaw from the bbox long edge (same as roboarm
+    ``Arm.gripper_angle_by_longer``).
+  * shift the grasp point by ``catch_offset`` along that yaw.
+  * output a vertical-down PoseStamped in ``arm/base_link`` at
+    ``default_desktop_height``.
+
+There is no fallback to the old camera-intrinsics + TF ray-plane
+algorithm. If the homography or tabletop height is missing, init fails
+with a clear configuration error.
 
 Three surfaces, sharing one ``_compute_grasp()`` math kernel:
 
@@ -61,8 +60,8 @@ Three surfaces, sharing one ``_compute_grasp()`` math kernel:
 
 Lifecycle (per Robonix developer guide §5):
     on_init         — parse cfg, atlas-resolve detect_object endpoint
-                      (informational), spawn rclpy thread (subs +
-                      pubs + service host).
+                      (informational), load roboarm homography, spawn
+                      rclpy thread (subs + pubs + service host).
     on_deactivate   — stop rclpy thread; publish a zero-pose to
                       /graspnet/grasps so subscribers see "service
                       stopped" instead of stale data.
@@ -108,29 +107,18 @@ _DEFAULT_CANDIDATES: list[str] = [
     "sheet music", "document", "monitor", "decorative picture",
 ]
 
-# Pre-calibrated approach quaternion from upstream yolo_grasp.py.
-# This is a single fixed top-down orientation; the live pipeline
-# does NOT estimate orientation from geometry. Replace via cfg
-# (orientation_xyzw) only if you've recalibrated.
-_DEFAULT_QUAT = (-0.1329, 0.1508, -0.6840, -0.7013)
-
-# ── vertical grasp mode constants ───────────────────────────────────────────
-# In vertical mode, the grasp pose is computed by intersecting the camera
-# ray through the bbox center with the table plane (z = z_table in
-# base_link), then writing a fixed vertical-down quaternion. This replaces
-# the depth-median back-projection used in the original algorithm.
+# ── roboarm-style grasp mode constants ──────────────────────────────────────
+# In roboarm mode, the grasp pose is computed exactly like roboarm's
+# llm/catch_by_llm.py:
+#   bbox center pixel -> 2D homography -> arm XY
+#   bbox long edge    -> gripper yaw
+#   XY + catch_offset -> final grasp point
 #
-# The pose is output in arm/base_link (not camera_color_optical_frame),
-# so piper_moveit_rbnx's TF transform becomes a no-op.
-_DEFAULT_Z_TABLE        = 0.02    # table height in base_link (m)
-_DEFAULT_Z_OFFSET        = 0.0    # TCP offset below z_table (m)
+# There is intentionally no fallback to the old ray-plane / TF algorithm.
+_DEFAULT_CATCH_OFFSET   = 0.01    # meters
+_DEFAULT_BOX_ROTATION_DEG = 0.0
 _DEFAULT_APPROACH_DIST   = 0.10   # pre/post grasp hover height (m)
-_DEFAULT_YAW_RAD         = 0.0    # default yaw (rad)
-_DEFAULT_RADIAL_YAW      = False  # if True, override yaw with atan2(y,x)
-_DEFAULT_RADIAL_YAW_OFFSET = 0.0  # extra yaw added on top of radial (rad)
 _DEFAULT_BASE_FRAME      = "arm/base_link"
-_DEFAULT_CAMERA_FRAME    = "camera_color_optical_frame"
-_DEFAULT_COLOR_INFO_TOPIC = "/camera/color/camera_info"
 
 # ── shared state ────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
@@ -155,17 +143,6 @@ _ros_ready_evt = threading.Event()
 _ros_thread_error: Optional[BaseException] = None
 _ROS_READY_TIMEOUT_S = 15.0
 
-# Latest depth + camera_info (subscribers update these from the rclpy
-# thread; readers — service handlers + auto-publish callback — read
-# under _state_lock). Both are raw ROS messages, decoded lazily.
-_latest_depth_msg = None         # sensor_msgs/Image
-_latest_cam_info = None          # sensor_msgs/CameraInfo
-
-# Vertical mode: latest T_base_cam (4×4 numpy array) cached by a periodic
-# TF lookup in the rclpy thread. None until the first successful lookup.
-_latest_T_base_cam = None       # numpy 4×4 or None
-_latest_T_stamp_s: float = 0.0  # monotonic time of last successful TF lookup
-
 # Latest /yolo/detect_objects message — cached unconditionally (i.e.
 # even when auto_publish_topic is OFF) so that grasp_request handlers
 # can resolve a bbox from object_name without making a blocking ROS
@@ -183,6 +160,9 @@ _latest_detected_objects_stamp_s: float = 0.0
 
 # auto-publish rate limit
 _last_auto_publish_time = 0.0
+
+# 3x3 pixel -> arm-plane homography loaded from cfg at init time.
+_homography_matrix = None
 
 
 # ── atlas: resolve upstream detect_object (informational) ───────────────────
@@ -218,92 +198,6 @@ def _resolve_detect_object_endpoint() -> Optional[str]:
         return None
 
 
-# ── geometry: depth → metric helpers ────────────────────────────────────────
-def _depth_to_numpy(depth_msg) -> Optional["object"]:
-    """Convert a sensor_msgs/Image depth frame to numpy (meters,
-    float32). Returns None on unsupported encoding."""
-    import numpy as np
-    from cv_bridge import CvBridge
-    bridge = _depth_to_numpy._bridge  # type: ignore[attr-defined]
-    try:
-        arr = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-    except Exception as e:  # noqa: BLE001
-        log.error("cv_bridge conversion failed: %s", e)
-        return None
-    a = np.asarray(arr)
-    if depth_msg.encoding in ("16UC1", "mono16"):
-        return a.astype(np.float32) * 0.001  # mm → m
-    if depth_msg.encoding == "32FC1":
-        return a.astype(np.float32)
-    log.error("unsupported depth encoding: %s", depth_msg.encoding)
-    return None
-
-
-def _depth_median_in_bbox(depth_m, bbox, *, grid: int,
-                          min_depth: float, max_depth: float) -> Optional[float]:
-    """Sample a `grid x grid` lattice inside bbox; return median of
-    depths within [min, max] meters. Returns None if no valid sample."""
-    import numpy as np
-    h, w = depth_m.shape[:2]
-    x_min, y_min, x_max, y_max = bbox
-    x0 = int(np.clip(math.floor(x_min), 0, w - 1))
-    x1 = int(np.clip(math.ceil(x_max),  0, w - 1))
-    y0 = int(np.clip(math.floor(y_min), 0, h - 1))
-    y1 = int(np.clip(math.ceil(y_max),  0, h - 1))
-    g = max(3, int(grid))
-    xs = np.linspace(x0, x1, g).astype(int)
-    ys = np.linspace(y0, y1, g).astype(int)
-    samples = []
-    for yy in ys:
-        for xx in xs:
-            z = float(depth_m[yy, xx])
-            if np.isfinite(z) and min_depth <= z <= max_depth and z > 0.0:
-                samples.append(z)
-    if not samples:
-        return None
-    return float(np.median(np.asarray(samples, dtype=np.float32)))
-
-
-def _parse_intrinsics(cam_info) -> tuple[float, float, float, float]:
-    """Return (fx, fy, cx, cy) from a sensor_msgs/CameraInfo."""
-    K = cam_info.k  # row-major: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-    return float(K[0]), float(K[4]), float(K[2]), float(K[5])
-
-
-def _pixel_to_table_xy(
-    u: float, v: float,
-    fx: float, fy: float, cx: float, cy: float,
-    T_base_cam, z_table: float,
-) -> tuple[float, float]:
-    """Ray-plane intersection: cast a ray from the camera through pixel
-    (u, v), transform it into base_link, and intersect with the table
-    plane z = z_table.
-
-    Returns (x, y) in base_link frame. Raises ValueError on degenerate
-    cases (ray parallel to table, intersection behind camera).
-    """
-    import numpy as np
-
-    # 1) pixel → camera optical frame unit direction
-    d_cam = np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
-    d_cam /= np.linalg.norm(d_cam)
-
-    # 2) rotate ray into base_link; origin = camera position in base_link
-    R_bc = T_base_cam[:3, :3]
-    t_bc = T_base_cam[:3, 3]
-    d_base = R_bc @ d_cam
-    o_base = t_bc
-
-    # 3) intersect with plane z = z_table
-    if abs(d_base[2]) < 1e-6:
-        raise ValueError("camera ray is parallel to table plane")
-    t_param = (z_table - o_base[2]) / d_base[2]
-    if t_param <= 0:
-        raise ValueError("intersection is behind camera")
-    p_base = o_base + t_param * d_base
-    return float(p_base[0]), float(p_base[1])
-
-
 def _vertical_quaternion(yaw_rad: float):
     """Quaternion for a vertical-down grasp (end-effector z-axis
     pointing at world -z), with an optional yaw rotation about the
@@ -328,6 +222,110 @@ def _vertical_quaternion(yaw_rad: float):
     return float(qx), float(qy), float(qz), float(qw)
 
 
+def _load_homography_matrix(cfg: dict[str, Any]):
+    """Load the mandatory roboarm 2D hand-eye homography.
+
+    Accepted config:
+      * homography_matrix: nested 3x3 list
+      * hand_eye_calibration_file / homography_file: path to a .npy
+    """
+    import numpy as np
+
+    inline = cfg.get("homography_matrix")
+    if inline is not None:
+        mat = np.asarray(inline, dtype=np.float64)
+    else:
+        raw_path = (
+            cfg.get("hand_eye_calibration_file")
+            or cfg.get("homography_file")
+            or cfg.get("homography_path")
+        )
+        if not raw_path:
+            raise ValueError(
+                "missing required roboarm homography config: set "
+                "hand_eye_calibration_file to a 3x3 .npy file or provide "
+                "homography_matrix inline"
+            )
+        path = os.path.expandvars(os.path.expanduser(str(raw_path)))
+        if not os.path.isabs(path):
+            pkg_root = os.environ.get(
+                "RBNX_PACKAGE_ROOT",
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            )
+            path = os.path.join(pkg_root, path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"hand_eye_calibration_file does not exist: {path}"
+            )
+        mat = np.load(path)
+
+    if mat.shape != (3, 3):
+        raise ValueError(f"homography matrix must be shape (3, 3), got {mat.shape}")
+    if not np.all(np.isfinite(mat)):
+        raise ValueError("homography matrix contains non-finite values")
+    return mat.astype(np.float64)
+
+
+def _pixel_to_arm_xy(u: float, v: float) -> tuple[float, float]:
+    """roboarm Arm.pixel2pos(): pixel center -> arm-plane XY."""
+    import numpy as np
+
+    if _homography_matrix is None:
+        raise ValueError("homography matrix is not loaded")
+    pixel_coords = np.array([[float(u)], [float(v)], [1.0]], dtype=np.float64)
+    world_coords = _homography_matrix @ pixel_coords
+    denom = float(world_coords[2, 0])
+    if abs(denom) < 1e-12:
+        raise ValueError("homography projection has near-zero scale")
+    world_coords /= denom
+    return float(world_coords[0, 0]), float(world_coords[1, 0])
+
+
+def _gripper_angle_by_longer(
+    u: float, v: float, w: float, h: float, angle_deg: float
+) -> float:
+    """roboarm Arm.gripper_angle_by_longer() without requiring cv2."""
+    import numpy as np
+
+    theta = math.radians(float(angle_deg))
+    c, s = math.cos(theta), math.sin(theta)
+    half_w, half_h = float(w) / 2.0, float(h) / 2.0
+    local = np.array(
+        [
+            [-half_w, -half_h],
+            [half_w, -half_h],
+            [half_w, half_h],
+            [-half_w, half_h],
+        ],
+        dtype=np.float64,
+    )
+    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+    box_points = local @ rot.T + np.array([float(u), float(v)], dtype=np.float64)
+
+    edge_01 = np.linalg.norm(box_points[0] - box_points[1])
+    edge_12 = np.linalg.norm(box_points[1] - box_points[2])
+    if edge_01 > edge_12:
+        long_edge_points = (
+            [box_points[0], box_points[1]]
+            if box_points[0][0] < box_points[1][0]
+            else [box_points[1], box_points[0]]
+        )
+    else:
+        long_edge_points = (
+            [box_points[1], box_points[2]]
+            if box_points[1][0] < box_points[2][0]
+            else [box_points[2], box_points[1]]
+        )
+
+    gripper_rot_rad = math.pi / 2 + math.atan2(
+        float(long_edge_points[1][1] - long_edge_points[0][1]),
+        float(long_edge_points[1][0] - long_edge_points[0][0]),
+    )
+    if gripper_rot_rad > math.pi / 2:
+        gripper_rot_rad -= math.pi
+    return float(gripper_rot_rad)
+
+
 def _compute_grasp(
     *,
     bbox_2d: list[float],
@@ -336,17 +334,15 @@ def _compute_grasp(
     cfg: dict[str, Any],
     object_name: str = "",
 ) -> dict:
-    """Geometric grasp computation — vertical-grasp version.
+    """roboarm-style grasp computation.
 
-    Instead of depth-median back-projection, this casts a ray from the
-    camera through the bbox center pixel, transforms it into base_link
-    via the hand-eye-calibrated TF, and intersects it with the table
-    plane (z = z_table). The pose is output in arm/base_link with a
-    fixed vertical-down quaternion.
+    The bbox center is projected to arm-plane XY via a required 3x3
+    homography. The end-effector yaw follows roboarm's long-edge rule,
+    then the grasp point is shifted by catch_offset along that yaw.
 
-    depth_msg is accepted but **ignored** in vertical mode — kept in
-    the signature for backward compatibility with callers that still
-    pass it.
+    depth_msg and cam_info are accepted for API compatibility but are
+    intentionally ignored. There is no fallback to the old TF
+    ray-plane algorithm.
 
     Returns the same dict shape regardless of success/failure:
         {
@@ -359,13 +355,23 @@ def _compute_grasp(
           "score":         float,
         }
     """
-    import numpy as np
-
     output_frame = cfg.get("output_frame", _DEFAULT_BASE_FRAME)
-    z_table      = float(cfg.get("z_table",       _DEFAULT_Z_TABLE))
-    z_offset     = float(cfg.get("z_offset",      _DEFAULT_Z_OFFSET))
-    yaw_rad      = float(cfg.get("default_yaw_rad", _DEFAULT_YAW_RAD))
+    if "default_desktop_height" not in cfg:
+        return {
+            "success": False,
+            "message": "missing required roboarm config: default_desktop_height",
+            "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
+            "frame_id": output_frame,
+            "gripper_width": 0.0,
+            "score": 0.0,
+        }
+    desktop_height = float(cfg.get("default_desktop_height"))
+    catch_offset = float(cfg.get("catch_offset", _DEFAULT_CATCH_OFFSET))
     width        = float(cfg.get("gripper_width_default", 0.04))
+    box_rotation_deg = float(
+        cfg.get("box_rotation_deg", _DEFAULT_BOX_ROTATION_DEG)
+    )
 
     fail = lambda msg: {  # noqa: E731
         "success": False, "message": msg,
@@ -375,57 +381,30 @@ def _compute_grasp(
         "gripper_width": 0.0, "score": 0.0,
     }
 
-    if cam_info is None:
-        return fail("no camera_info received yet")
-    if not bbox_2d or len(bbox_2d) != 4:
-        return fail(f"bbox_2d must be length 4, got {bbox_2d!r}")
-
-    # ── read cached TF (base_link ← camera_color_optical_frame) ──
-    with _state_lock:
-        T_base_cam = _latest_T_base_cam
-        T_age_s    = time.monotonic() - _latest_T_stamp_s if _latest_T_stamp_s else 999.0
-
-    if T_base_cam is None:
-        return fail(
-            "no TF transform cached yet (arm/base_link ← "
-            "camera_color_optical_frame). Is easy_handeye2_rbnx "
-            "publishing the hand-eye TF?")
-    if T_age_s > 5.0:
-        log.warning("TF cache is %.1fs old — hand-eye TF may be stale", T_age_s)
+    if not bbox_2d or len(bbox_2d) not in (4, 5):
+        return fail(f"bbox_2d must be length 4 or 5, got {bbox_2d!r}")
 
     # ── bbox center pixel ──
-    x_min, y_min, x_max, y_max = (float(v) for v in bbox_2d)
+    x_min, y_min, x_max, y_max = (float(value) for value in bbox_2d[:4])
+    if len(bbox_2d) == 5:
+        box_rotation_deg = float(bbox_2d[4])
     u = 0.5 * (x_min + x_max)
     v_pix = 0.5 * (y_min + y_max)
+    bbox_w = abs(x_max - x_min)
+    bbox_h = abs(y_max - y_min)
+    if bbox_w <= 0.0 or bbox_h <= 0.0:
+        return fail(f"bbox has non-positive size: {bbox_2d!r}")
 
-    # ── camera intrinsics ──
-    fx, fy, cx, cy = _parse_intrinsics(cam_info)
-    if fx <= 0.0 or fy <= 0.0:
-        return fail(f"invalid intrinsics fx={fx} fy={fy}")
-
-    # ── ray-plane intersection ──
     try:
-        x_base, y_base = _pixel_to_table_xy(
-            u, v_pix, fx, fy, cx, cy, T_base_cam, z_table)
+        target_x, target_y = _pixel_to_arm_xy(u, v_pix)
     except ValueError as e:
-        return fail(f"ray-plane intersection failed: {e}")
+        return fail(f"pixel2pos failed: {e}")
 
-    # ── assemble pose ──
-    grasp_z = z_table + z_offset  # TCP height (z_offset < 0 → dip below table)
-
-    # Plan-A wrist-flip mitigation: when `radial_yaw` is enabled, override
-    # the fixed default yaw with atan2(y_base, x_base) (+ optional offset).
-    # Aligning the gripper opening with the radial direction from the arm
-    # base to the target sharply narrows joint6's valid range, so MoveIt's
-    # IK is far less likely to pick the "wrist-flipped" branch (j6 ± π).
-    # `radial_yaw_offset_rad` lets you rotate the opening by e.g. ±π/2
-    # if you want the fingers to close *across* the radius instead of
-    # *along* it.
-    if bool(cfg.get("radial_yaw", _DEFAULT_RADIAL_YAW)):
-        offset = float(cfg.get("radial_yaw_offset_rad",
-                                _DEFAULT_RADIAL_YAW_OFFSET))
-        yaw_rad = float(np.arctan2(y_base, x_base)) + offset
-
+    yaw_rad = _gripper_angle_by_longer(
+        u, v_pix, bbox_w, bbox_h, box_rotation_deg
+    )
+    grasp_x = target_x + catch_offset * math.cos(yaw_rad)
+    grasp_y = target_y + catch_offset * math.sin(-yaw_rad)
     qx, qy, qz, qw = _vertical_quaternion(yaw_rad)
 
     # Score: crude quality proxy based on bbox area (same as before).
@@ -435,18 +414,22 @@ def _compute_grasp(
     score = 0.8
 
     log.info(
-        "vertical grasp: object=%r uv=(%.1f,%.1f) → base_link "
-        "(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
-        object_name, u, v_pix, x_base, y_base, grasp_z, yaw_rad)
+        "roboarm grasp: object=%r uv=(%.1f,%.1f) bbox=(%.1fx%.1f, rot=%.1f) "
+        "pixel2pos=(x=%.3f, y=%.3f) offset=%.3f -> "
+        "grasp=(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
+        object_name, u, v_pix, bbox_w, bbox_h, box_rotation_deg,
+        target_x, target_y, catch_offset, grasp_x, grasp_y,
+        desktop_height, yaw_rad)
 
     return {
         "success":       True,
         "message":       f"ok (object={object_name!r}, "
                          f"u,v=({u:.1f},{v_pix:.1f}), "
-                         f"base_xy=({x_base:.3f},{y_base:.3f}))",
+                         f"arm_xy=({grasp_x:.3f},{grasp_y:.3f}), "
+                         f"yaw={yaw_rad:.3f})",
         "pose": {
-            "position":    {"x": float(x_base), "y": float(y_base),
-                            "z": float(grasp_z)},
+            "position":    {"x": float(grasp_x), "y": float(grasp_y),
+                            "z": float(desktop_height)},
             "orientation": {"x": qx, "y": qy, "z": qz, "w": qw},
         },
         "frame_id":      output_frame,
@@ -468,24 +451,15 @@ def _ros_thread_main() -> None:
     _ROS_READY_TIMEOUT_S (or sooner).
     """
     global _ros_node, _grasps_pub
-    global _latest_depth_msg, _latest_cam_info
-    global _latest_T_base_cam, _latest_T_stamp_s
     global _ros_thread_error
 
     node = None
     try:
         import rclpy                                              # noqa: E402
         from rclpy.node import Node                               # noqa: E402
-        from sensor_msgs.msg import Image, CameraInfo             # noqa: E402
         from graspnet_msgs.srv import GraspRequest                # noqa: E402
         from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
         from graspnet_msgs.msg import DetectedObjects             # noqa: E402
-        from cv_bridge import CvBridge                            # noqa: E402
-        import tf2_ros                                            # noqa: E402
-        import numpy as np                                        # noqa: E402
-
-        # cv_bridge instance attached to the helper for cheap reuse
-        _depth_to_numpy._bridge = CvBridge()  # type: ignore[attr-defined]
 
         rclpy.init(args=None)
         node = Node("yolo_grasp_node")
@@ -493,71 +467,8 @@ def _ros_thread_main() -> None:
 
         cfg = _resolved_cfg
 
-        depth_topic    = str(cfg.get("depth_topic",          "/camera/depth/image_raw"))
-        cam_info_topic = str(cfg.get("camera_info_topic",    _DEFAULT_COLOR_INFO_TOPIC))
         det_topic      = str(cfg.get("detect_objects_topic", "/yolo/detect_objects"))
         grasps_topic   = str(cfg.get("grasps_topic",         "/graspnet/grasps"))
-
-        base_frame   = str(cfg.get("base_frame",   _DEFAULT_BASE_FRAME))
-        camera_frame = str(cfg.get("camera_frame", _DEFAULT_CAMERA_FRAME))
-
-        # Subscribers — feed the latest depth / camera_info into shared
-        # state. We deliberately keep only the most recent message; older
-        # ones are dropped because grasp_request is always "use what's
-        # current right now". qos depth=10 mirrors upstream.
-        #
-        # NOTE: In vertical mode, depth is NOT consumed by _compute_grasp
-        # (ray-plane intersection replaces depth back-projection). The
-        # subscription is kept for backward compatibility / auto-publish
-        # stream mode which still needs it.
-        def _on_depth(msg):
-            global _latest_depth_msg
-            with _state_lock:
-                _latest_depth_msg = msg
-
-        def _on_cam_info(msg):
-            global _latest_cam_info
-            with _state_lock:
-                _latest_cam_info = msg
-
-        node.create_subscription(Image,      depth_topic,    _on_depth,    10)
-        node.create_subscription(CameraInfo, cam_info_topic, _on_cam_info, 10)
-        log.info("subscribing depth=%s camera_info=%s", depth_topic, cam_info_topic)
-
-        # ── TF: cache T_base_cam periodically for the vertical grasp
-        # ray-plane intersection. The hand-eye TF (base_link ←
-        # camera_color_optical_frame) is published by easy_handeye2_rbnx.
-        # We poll it every 0.5s in the spin loop below; _compute_grasp
-        # reads the cached 4×4 matrix from shared state. ──
-        tf_buffer = tf2_ros.Buffer()
-        tf_listener = tf2_ros.TransformListener(tf_buffer, node)
-        log.info("TF listener ready: %s ← %s", base_frame, camera_frame)
-
-        def _poll_tf():
-            """Look up base_link ← camera TF and cache the 4×4 matrix."""
-            global _latest_T_base_cam, _latest_T_stamp_s
-            try:
-                tfm = tf_buffer.lookup_transform(
-                    base_frame, camera_frame,
-                    rclpy.time.Time(),  # latest available
-                    timeout=rclpy.duration.Duration(seconds=0.05))
-            except Exception:  # noqa: BLE001
-                return  # transform not yet available — will retry next tick
-            t = tfm.transform.translation
-            r = tfm.transform.rotation
-            # quaternion → rotation matrix
-            qx, qy, qz, qw = r.x, r.y, r.z, r.w
-            R = np.array([
-                [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),   2*(qx*qz + qy*qw)],
-                [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
-                [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),   1 - 2*(qx*qx + qy*qy)],
-            ])
-            T = np.eye(4)
-            T[:3, :3] = R
-            T[:3, 3]  = [t.x, t.y, t.z]
-            with _state_lock:
-                _latest_T_base_cam = T
-                _latest_T_stamp_s  = time.monotonic()
 
         # Publisher — C++ piper_moveit_control + every other downstream.
         _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
@@ -661,15 +572,9 @@ def _ros_thread_main() -> None:
 
     # Spin until shutdown.
     import rclpy  # noqa: E402  (re-import for the spin loop scope)
-    _tf_poll_timer = 0.0
     while not _ros_stop_evt.is_set():
         try:
             rclpy.spin_once(node, timeout_sec=0.1)
-            # Poll TF every ~0.5s (10 spin iterations at 0.1s each).
-            _tf_poll_timer += 0.1
-            if _tf_poll_timer >= 0.5:
-                _tf_poll_timer = 0.0
-                _poll_tf()
         except Exception as e:  # noqa: BLE001
             # Per-iteration errors should NOT bring the whole thread down
             # — that would silently re-introduce the "alive but mute"
@@ -685,7 +590,7 @@ def _ros_thread_main() -> None:
             from graspnet_msgs.msg import GraspPose as RosGraspPose  # noqa: E402
             zero = RosGraspPose()
             _fill_zero_grasp(zero, frame_id=str(_resolved_cfg.get("output_frame",
-                                                       "camera_color_optical_frame")))
+                                                       _DEFAULT_BASE_FRAME)))
             _grasps_pub.publish(zero)
             log.info("published shutdown zero-pose to %s",
                      _resolved_cfg.get("grasps_topic", "/graspnet/grasps"))
@@ -718,8 +623,8 @@ def _fill_zero_grasp(gp, *, frame_id: str) -> None:
 
 def _on_detected_objects(msg, candidates: list[str]) -> None:
     """Auto-publish handler. Picks the first detection whose
-    object_name matches the candidates allowlist, computes a grasp
-    using the latest depth + camera_info, and publishes."""
+    object_name matches the candidates allowlist, computes a
+    roboarm-style grasp from its bbox, and publishes."""
     global _last_auto_publish_time
 
     if not msg.objects:
@@ -742,11 +647,8 @@ def _on_detected_objects(msg, candidates: list[str]) -> None:
         return
 
     bbox = list(best.bbox_2d)
-    with _state_lock:
-        depth = _latest_depth_msg
-        info  = _latest_cam_info
     result = _compute_grasp(
-        bbox_2d=bbox, depth_msg=depth, cam_info=info,
+        bbox_2d=bbox, depth_msg=None, cam_info=None,
         cfg=_resolved_cfg, object_name=best.object_name,
     )
     if not result["success"]:
@@ -899,9 +801,8 @@ def _serve_grasp_request(*, object_name, bbox_2d, object_center_3d, retry):
     """Shared handler for both RPC surfaces (MCP + ROS service).
 
     If bbox_2d is missing, we ask yolo_world's detect_object service
-    first. ``object_center_3d`` from the caller is currently advisory
-    only — the geometric estimator always re-back-projects from depth
-    so that "depth at the time of grasp" matches the published TF.
+    first. ``object_center_3d`` from the caller is advisory only; the
+    roboarm-style estimator uses bbox center + 2D homography.
     """
     if not bbox_2d:
         det = _call_detect_object(object_name)
@@ -912,18 +813,14 @@ def _serve_grasp_request(*, object_name, bbox_2d, object_center_3d, retry):
                 "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
                          "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
                 "frame_id": _resolved_cfg.get("output_frame",
-                                              "camera_color_optical_frame"),
+                                              _DEFAULT_BASE_FRAME),
                 "gripper_width": 0.0,
                 "score": 0.0,
             }
         bbox_2d = det["bbox_2d"]
 
-    with _state_lock:
-        depth = _latest_depth_msg
-        info  = _latest_cam_info
-
     return _compute_grasp(
-        bbox_2d=bbox_2d, depth_msg=depth, cam_info=info,
+        bbox_2d=bbox_2d, depth_msg=None, cam_info=None,
         cfg=_resolved_cfg, object_name=object_name,
     )
 
@@ -936,7 +833,7 @@ def init(cfg):
       2. atlas-resolve detect_object endpoint (informational)
       3. spawn rclpy thread
     """
-    global _initialized, _resolved_cfg
+    global _initialized, _resolved_cfg, _homography_matrix
     with _state_lock:
         if _initialized:
             return Ok()
@@ -947,9 +844,25 @@ def init(cfg):
             cfg = json.loads(cfg) if cfg else {}
         except json.JSONDecodeError as e:
             return Err(f"bad config_json: {e}")
+
+    if "default_desktop_height" not in cfg:
+        return Err(
+            "missing required roboarm config: default_desktop_height "
+            "(meters, arm base frame z for the grasp height)"
+        )
+    try:
+        float(cfg["default_desktop_height"])
+    except Exception as e:  # noqa: BLE001
+        return Err(f"bad default_desktop_height: {e}")
+
+    try:
+        _homography_matrix = _load_homography_matrix(cfg)
+    except Exception as e:  # noqa: BLE001
+        return Err(f"bad roboarm homography config: {e}")
+
     _resolved_cfg = cfg
 
-    log.info("cfg: %d keys (auto_publish=%s, candidates=%d)",
+    log.info("cfg: %d keys (roboarm homography loaded, auto_publish=%s, candidates=%d)",
              len(cfg), cfg.get("auto_publish_topic", False),
              len(cfg.get("candidates") or _DEFAULT_CANDIDATES))
 
@@ -1037,7 +950,8 @@ def grasp_request(req: GraspRequest_Request) -> GraspRequest_Response:
     If the caller supplies ``bbox_2d`` (length 4 = [x_min, y_min,
     x_max, y_max] in pixels on the RGB frame), we use it directly.
     Otherwise we ask yolo_world's /yolo/detect_object service for one
-    on the fly. ``object_center_3d`` from the caller is advisory only.
+    on the fly. ``object_center_3d`` from the caller is advisory only;
+    the roboarm-style estimator uses bbox center + 2D homography.
     """
     result = _serve_grasp_request(
         object_name      = req.object_name,
