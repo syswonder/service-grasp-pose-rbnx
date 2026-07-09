@@ -201,27 +201,15 @@ def _resolve_detect_object_endpoint() -> Optional[str]:
 
 
 def _vertical_quaternion(yaw_rad: float):
-    """Quaternion for a vertical-down grasp (end-effector z-axis
-    pointing at world -z), with an optional yaw rotation about the
-    world z-axis.
+    """Quaternion for roboarm's vertical-down grasp convention.
 
     Returns (qx, qy, qz, qw).
     """
-    import numpy as np
-    # Euler roll=pi, pitch=0, yaw=yaw_rad in 'sxyz' convention.
-    # roll=pi flips the end-effector so it points down.
-    cr = np.cos(np.pi / 2)
-    sr = np.sin(np.pi / 2)
-    cp = 1.0  # cos(0)
-    sp = 0.0  # sin(0)
-    cy = np.cos(yaw_rad / 2)
-    sy = np.sin(yaw_rad / 2)
-    # quaternion_from_euler(pi, 0, yaw, 'sxyz') expanded:
-    qx = sr * cp * cy - cr * sp * sy
-    qy = cr * sp * cy + sr * cp * sy
-    qz = cr * cp * sy - sr * sp * cy
-    qw = cr * cp * cy + sr * sp * sy
-    return float(qx), float(qy), float(qz), float(qw)
+    half_yaw = float(yaw_rad) * 0.5
+    # Matches roboarm:
+    #   R.from_euler("zyx", [degrees(yaw), 180.0, 0.0], degrees=True)
+    # The resulting scipy xyzw quaternion is [sin(yaw/2), cos(yaw/2), 0, 0].
+    return float(math.sin(half_yaw)), float(math.cos(half_yaw)), 0.0, 0.0
 
 
 def _load_homography_matrix(cfg: dict[str, Any]):
