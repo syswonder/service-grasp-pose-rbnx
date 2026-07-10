@@ -1,43 +1,24 @@
-# yolo_grasp_rbnx — roboarm-style grasp-pose estimator service.
+# grasp_pose_rbnx — pure MCP roboarm-style grasp-pose estimator.
 #
-# Pure CPU. No ML model, no GPU, no torch. Owns
-# `robonix/service/perception/grasp_pose/*`.
+# Pure CPU. No ML model, no GPU, no torch, no legacy /graspnet ROS
+# trigger path. Owns `robonix/service/perception/grasp_pose/*`.
 #
-# Roboarm-style version: bbox center pixel is mapped to arm-plane XY
-# through a required 3x3 2D hand-eye homography, gripper yaw is derived
-# from the bbox long edge, and catch_offset is applied to the final
-# grasp point. Depth, camera intrinsics, and hand-eye TF are NOT used
-# by the algorithm. Missing homography / desktop height is a hard init
-# error; there is no fallback to the previous ray-plane implementation.
+# The caller must provide bbox_2d. The bbox center pixel is mapped to
+# arm-plane XY through a required 3x3 2D hand-eye homography, gripper
+# yaw is derived from the bbox long edge, and catch_offset is applied
+# to the final grasp point. Depth, camera intrinsics, and hand-eye TF
+# are NOT used by the algorithm.
 #
-# Three roles:
-#   * SERVER (atlas MCP): grasp_pose/grasp_request — Pilot's new path
-#   * SERVER (legacy ROS): /graspnet/grasp_request + /graspnet/grasps
-#                          — pick.py + C++ piper_moveit_control compat
-#   * CLIENT (legacy ROS): /yolo/detect_object — owned by yolo_world_rbnx
-#                          (will switch to atlas MCP in Stage 6)
-#
-# Plus a fourth, "auto-publish" mode (default ON): subscribe to the
-# legacy /yolo/detect_objects topic, and for every detection whose
-# object_name is in `cfg.candidates`, compute a grasp + publish to
-# /graspnet/grasps. This is the upstream "stream demo" behaviour —
-# OFF BY DEFAULT in this package because the cpp executor triggers a
-# real arm motion on the FIRST /graspnet/grasps it sees while idle,
-# which is dangerous when no caller asked for a grasp. Set
-# auto_publish_topic=true to opt-in to the legacy stream demo.
+# Runtime role:
+#   * SERVER (atlas MCP): grasp_pose/grasp_request
 #
 # Lifecycle:
-#   on_init      — light-medium: parse cfg, atlas-resolve detect_object
-#                  endpoint (informational), load homography, spawn rclpy
-#                  thread (detect_objects sub + /graspnet/grasps publisher
-#                  + service host).
-#   on_deactivate — stop rclpy thread; publish a zero-pose to
-#                   /graspnet/grasps so subscribers see "service stopped".
+#   on_init       — parse cfg, load homography.
+#   on_deactivate — clear initialized state.
 #
-# Capability surface (mode = abstract, transport = wire):
-#   service/perception/grasp_pose/driver         mode=rpc        transport=gRPC  Driver(INIT)
-#   service/perception/grasp_pose/grasp_request  mode=rpc        transport=MCP   GraspRequest.srv
-#   service/perception/grasp_pose/grasps         mode=topic_out  transport=ROS2  GraspPose.msg
+# Capability surface:
+#   service/perception/grasp_pose/driver         mode=rpc transport=gRPC
+#   service/perception/grasp_pose/grasp_request  mode=rpc transport=MCP
 #
 # Config (passed via Driver(CMD_INIT, config_json)):
 #
@@ -57,46 +38,23 @@
 #                                            pre/post grasp (m). Used by
 #                                            pick_skill_rbnx.
 #   output_frame                str         default arm/base_link — pose output
-#                                            frame consumed by piper_moveit.
-#
-#   ── candidate selection (auto-publish stream mode) ──
-#   candidates                  list[str]   default = upstream allowlist of
-#                                            ~15 prompt-free YOLOE class names
-#                                            (bookmark / lamp / paper / etc.)
-#   auto_publish_topic          bool        DEFAULT FALSE — opt-in only.
-#                                            true → subscribe to
-#                                            detect_objects_topic and stream
-#                                            grasps for every match.
-#   auto_publish_min_interval_s float       default 0.0   — rate limit (s).
-#                                            0 means publish every detection.
-#
-#   ── ROS topic names (compat surfaces) ──
-#   depth_topic                 str         default /camera/depth/image_raw
-#                                            (not consumed; kept for compat)
-#   detect_objects_topic        str         default /yolo/detect_objects
-#   grasps_topic                str         default /graspnet/grasps
+#                                            frame consumed by roboarm_ik.
 #
 #   ── Output knobs ──
 #   gripper_width_default       float       default 0.04 — returned to caller
 #
-# Vendored:
-#   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
-#                        (GraspRequest, GraspPose, ObjectDetectionRequest,
-#                        DetectedObjects, etc.)
-#   yolo_grasp/_upstream/yolo_grasp.py — preserved upstream source
-#                        (kept as algorithm reference; main.py is what
-#                        actually runs).
-#   config/vertical_grasp.yaml — config notes; filename kept for compatibility.
+# config/vertical_grasp.yaml is documentation only; runtime config comes
+# from the deploy manifest.
 manifestVersion: 1
 
 package:
-  name: com.robonix.piper_grasp.yolo_grasp
+  name: com.robonix.piper_grasp.grasp_pose
   version: 0.1.0
   vendor: robonix
-  description: Geometric grasp-pose estimator (atlas + ROS dual surface).
+  description: Geometric grasp-pose estimator (pure MCP).
   license: MulanPSL-2.0
 
-capability_id: yolo_grasp
+capability_id: grasp_pose
 
 build: bash scripts/build.sh
 start: bash scripts/start.sh
@@ -104,4 +62,3 @@ start: bash scripts/start.sh
 capabilities:
   - name: robonix/service/perception/grasp_pose/driver
   - name: robonix/service/perception/grasp_pose/grasp_request
-  - name: robonix/service/perception/grasp_pose/grasps

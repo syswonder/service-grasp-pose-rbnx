@@ -34,7 +34,7 @@ roboarm_grasp:
   # detector passes bbox_2d length 5, the fifth value overrides this.
   box_rotation_deg: 0.0
 
-  # Pose output frame consumed by piper_moveit.
+  # Pose output frame consumed by roboarm_ik.
   output_frame: arm/base_link
 
   # Returned to callers as advisory grasp width. pick_skill currently
