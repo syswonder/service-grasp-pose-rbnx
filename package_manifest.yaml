@@ -81,6 +81,8 @@ package:
   vendor: robonix
   description: Geometric grasp-pose estimator (atlas + ROS dual surface).
   license: MulanPSL-2.0
+  tags: [service, perception, grasp_pose, grasp, ros2]
+  maintainers: ["lhw2002426 <lhw2002426@users.noreply.github.com>"]
 
 capability_id: yolo_grasp
 
