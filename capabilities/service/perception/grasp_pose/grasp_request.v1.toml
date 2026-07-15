@@ -10,7 +10,7 @@
 # in the IDL for wire compatibility but are ignored by this implementation.
 #
 # IDL: lib/grasp/srv/GraspRequest.srv (package-local). This package exposes
-# only the MCP path; legacy ROS /graspnet compatibility has been removed.
+# the robonix gRPC path; legacy ROS /graspnet compatibility has been removed.
 [contract]
 id      = "robonix/service/perception/grasp_pose/grasp_request"
 version = "1"

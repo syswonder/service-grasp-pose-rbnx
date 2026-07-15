@@ -1,4 +1,4 @@
-# grasp_pose_rbnx — pure MCP roboarm-style grasp-pose estimator.
+# grasp_pose_rbnx — gRPC roboarm-style grasp-pose estimator.
 #
 # Pure CPU. No ML model, no GPU, no torch, no legacy /graspnet ROS
 # trigger path. Owns `robonix/service/perception/grasp_pose/*`.
@@ -10,7 +10,7 @@
 # are NOT used by the algorithm.
 #
 # Runtime role:
-#   * SERVER (atlas MCP): grasp_pose/grasp_request
+#   * SERVER (atlas gRPC): grasp_pose/grasp_request
 #
 # Lifecycle:
 #   on_init       — parse cfg, load homography.
@@ -18,7 +18,7 @@
 #
 # Capability surface:
 #   service/perception/grasp_pose/driver         mode=rpc transport=gRPC
-#   service/perception/grasp_pose/grasp_request  mode=rpc transport=MCP
+#   service/perception/grasp_pose/grasp_request  mode=rpc transport=gRPC
 #
 # Config (passed via Driver(CMD_INIT, config_json)):
 #
@@ -51,7 +51,7 @@ package:
   name: robonix.service.grasp_pose
   version: 0.1.0
   vendor: robonix
-  description: Geometric grasp-pose estimator (pure MCP).
+  description: Geometric grasp-pose estimator (gRPC).
   license: MulanPSL-2.0
   tags: [service, perception, grasp_pose, grasp, ros2]
   maintainers: ["lhw2002426 <lhw2002426@users.noreply.github.com>"]

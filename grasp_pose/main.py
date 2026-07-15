@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MulanPSL-2.0
-"""Pure MCP roboarm-style grasp-pose estimator.
+"""Roboarm-style grasp-pose estimator.
 
 This service owns ``robonix/service/perception/grasp_pose/*`` and exposes one
-runtime tool: ``grasp_request``. It does not publish legacy ROS topics and does
+runtime RPC: ``grasp_request``. It does not publish legacy ROS topics and does
 not host the old ``/graspnet/grasp_request`` service; downstream execution is
 handled explicitly by ``pick_skill -> roboarm_ik``.
 """
@@ -293,7 +293,7 @@ def init(cfg):
     _resolved_cfg = cfg
     with _state_lock:
         _initialized = True
-    log.info("init complete: pure MCP grasp_request live (cfg keys=%d)",
+    log.info("init complete: gRPC grasp_request live (cfg keys=%d)",
              len(cfg))
     return Ok()
 
@@ -307,42 +307,38 @@ def deactivate():
     return Ok()
 
 
-from grasp_mcp import (  # noqa: E402  pylint: disable=wrong-import-position
-    GraspRequest_Request, GraspRequest_Response,
-)
-from geometry_msgs_mcp import (  # noqa: E402
-    PoseStamped, Pose, Point, Quaternion,
-)
-from std_msgs_mcp import Header  # noqa: E402
-from builtin_interfaces_mcp import Time  # noqa: E402
+import grasp_pb2  # noqa: E402  pylint: disable=wrong-import-position
+import geometry_msgs_pb2  # noqa: E402
+import std_msgs_pb2  # noqa: E402
+import builtin_interfaces_pb2  # noqa: E402
 
 
-@grasp_pose.mcp("robonix/service/perception/grasp_pose/grasp_request")
-def grasp_request(req: GraspRequest_Request) -> GraspRequest_Response:
+@grasp_pose.grpc("robonix/service/perception/grasp_pose/grasp_request")
+def grasp_request(req: grasp_pb2.GraspRequest_Request) -> grasp_pb2.GraspRequest_Response:
     """Compute a grasp pose from a caller-supplied RGB bbox."""
     result = _serve_grasp_request(
         object_name=req.object_name,
         bbox_2d=list(req.bbox_2d) if req.bbox_2d else [],
     )
     p = result["pose"]
-    pose_stamped = PoseStamped(
-        header=Header(
-            stamp=Time(sec=0, nanosec=0),
+    pose_stamped = geometry_msgs_pb2.PoseStamped(
+        header=std_msgs_pb2.Header(
+            stamp=builtin_interfaces_pb2.Time(sec=0, nanosec=0),
             frame_id=result["frame_id"],
         ),
-        pose=Pose(
-            position=Point(
+        pose=geometry_msgs_pb2.Pose(
+            position=geometry_msgs_pb2.Point(
                 x=float(p["position"]["x"]),
                 y=float(p["position"]["y"]),
                 z=float(p["position"]["z"])),
-            orientation=Quaternion(
+            orientation=geometry_msgs_pb2.Quaternion(
                 x=float(p["orientation"]["x"]),
                 y=float(p["orientation"]["y"]),
                 z=float(p["orientation"]["z"]),
                 w=float(p["orientation"]["w"])),
         ),
     )
-    return GraspRequest_Response(
+    return grasp_pb2.GraspRequest_Response(
         grasp_pose=pose_stamped,
         gripper_width=float(result["gripper_width"]),
         score=float(result["score"]),
