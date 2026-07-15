@@ -1,0 +1,45 @@
+# Roboarm-style grasp configuration.
+#
+# NOTE: This file is documentation only. Runtime config comes from the
+# deploy manifest's yolo_grasp.config block.
+#
+# The filename is kept for compatibility with older notes, but the
+# algorithm is no longer the old vertical ray-plane implementation.
+roboarm_grasp:
+  # REQUIRED. Path to roboarm's 3x3 2D homography .npy file, mapping
+  # image pixel [u, v, 1] to arm-plane [x, y, 1].
+  hand_eye_calibration_file: /absolute/path/to/2d_homography.npy
+
+  # Alternative to hand_eye_calibration_file:
+  # homography_matrix:
+  #   - [1.0, 0.0, 0.0]
+  #   - [0.0, 1.0, 0.0]
+  #   - [0.0, 0.0, 1.0]
+
+  # REQUIRED. Same meaning as roboarm config.yaml default_desktop_height.
+  # This is the final grasp z in arm/base_link, in meters.
+  default_desktop_height: 0.075
+
+  # Same meaning as roboarm catch_offset. The grasp XY is shifted by
+  # catch_offset along the computed gripper yaw.
+  catch_offset: 0.01
+
+  # Global XY bias applied after homography and before catch_offset.
+  # Positive / negative directions follow the output_frame axes.
+  bias_x: 0.0
+  bias_y: 0.0
+
+  # If bbox_2d has only [x_min, y_min, x_max, y_max], this rotation is
+  # used when computing roboarm's long-edge gripper yaw. If a future
+  # detector passes bbox_2d length 5, the fifth value overrides this.
+  box_rotation_deg: 0.0
+
+  # Pose output frame consumed by roboarm_ik.
+  output_frame: arm/base_link
+
+  # Returned to callers as advisory grasp width. pick_skill currently
+  # controls open/close widths for the three-stage motion.
+  gripper_width_default: 0.04
+
+  # pick_skill's hover height. Kept here for operator reference.
+  approach_dist: 0.10

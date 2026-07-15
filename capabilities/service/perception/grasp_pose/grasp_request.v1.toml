@@ -1,17 +1,16 @@
-# Compute a grasp pose for a named object inside an optional 2D ROI +
-# 3D centroid hint. The handler may internally call
-# robonix/service/perception/object_detect/detect_object to localise
-# the target if bbox_2d / object_center_3d are empty.
+# Compute a grasp pose for a named object inside a caller-supplied 2D ROI.
 #
-# Output is a PoseStamped in camera_color_optical_frame plus a
-# gripper width. Downstream piper_moveit consumers transform the pose
-# into base_link via the `link6 → camera_color_optical_frame` static
-# TF (Stage 3B easy_handeye2_rbnx).
+# Roboarm-style version: the handler projects the bbox center pixel to
+# arm-plane XY through a required 3x3 2D homography, derives gripper yaw
+# from the bbox long edge, applies catch_offset to the final grasp point,
+# and outputs a vertical-down pose in arm/base_link at
+# default_desktop_height.
 #
-# IDL: lib/grasp/srv/GraspRequest.srv (package-local). Schema is
-# bytes-compatible with upstream graspnet_msgs/srv/GraspRequest.srv,
-# just renamed for the robonix namespace. Same handler serves both
-# the MCP path and the legacy ROS service /graspnet/grasp_request.
+# Depth / camera_info / TF are NOT consumed. object_center_3d and retry stay
+# in the IDL for wire compatibility but are ignored by this implementation.
+#
+# IDL: lib/grasp/srv/GraspRequest.srv (package-local). This package exposes
+# only the MCP path; legacy ROS /graspnet compatibility has been removed.
 [contract]
 id      = "robonix/service/perception/grasp_pose/grasp_request"
 version = "1"
@@ -20,6 +19,3 @@ idl     = "grasp/srv/GraspRequest.srv"
 
 [mode]
 type = "rpc"
-
-[semantics]
-user_invocable = true
