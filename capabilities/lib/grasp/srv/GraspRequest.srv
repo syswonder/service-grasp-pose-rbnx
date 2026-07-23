@@ -11,6 +11,13 @@ float64[] bbox_2d
 # Ignored by this implementation.
 float64[] object_center_3d
 
+# Coarse principal-axis orientation label from the detector, one of:
+#   "vertical" | "horizontal" | "diag_tlbr" | "diag_trbl" | "unknown"
+# When present and not "unknown"/"" the grasp yaw is derived directly
+# from this label instead of the bbox long edge. Any other value is
+# treated as "unknown" and the bbox-long-edge fallback is used.
+string orientation
+
 # Ignored by this implementation.
 int32 retry
 ---

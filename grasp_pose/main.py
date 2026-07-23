@@ -35,6 +35,51 @@ _DEFAULT_BIAS_X = 0.0
 _DEFAULT_BIAS_Y = 0.0
 _DEFAULT_BASE_FRAME = "arm/base_link"
 
+# Discrete detector-supplied orientation labels -> gripper yaw (rad).
+#
+# The convention (matches _gripper_angle_by_longer + _vertical_quaternion):
+#   * yaw is the angle of the *gripper closing line* (i.e. the line between
+#     the two finger tips) w.r.t. the image x-axis, in (-pi/2, pi/2].
+#   * a good vertical grasp puts the closing line PERPENDICULAR to the
+#     object's principal axis, so yaw = axis_angle + pi/2  (mod pi).
+#
+# Image y goes down, so:
+#   horizontal (axis 0)     -> yaw = +pi/2
+#   vertical   (axis pi/2)  -> yaw = 0
+#   diag_tlbr  (axis +pi/4, "\") -> yaw = -pi/4   (folded from 3pi/4)
+#   diag_trbl  (axis +3pi/4, "/") -> yaw = +pi/4
+_ORIENTATION_YAW_RAD = {
+    "horizontal": math.pi / 2.0,
+    "vertical":   0.0,
+    "diag_tlbr":  -math.pi / 4.0,
+    "diag_trbl":   math.pi / 4.0,
+}
+# Aliases forgiving of upstream drift; anything not in this set folds to
+# "unknown" and the bbox-long-edge fallback is used.
+_ORIENTATION_ALIASES = {
+    "up_down":   "vertical",   "updown":   "vertical",  "portrait":  "vertical",
+    "left_right":"horizontal", "leftright":"horizontal","landscape": "horizontal",
+    "tl_br":     "diag_tlbr",  "tlbr":     "diag_tlbr", "backslash": "diag_tlbr",
+    "\\":        "diag_tlbr",
+    "tr_bl":     "diag_trbl",  "trbl":     "diag_trbl", "slash":     "diag_trbl",
+    "/":         "diag_trbl",
+}
+
+
+def _yaw_from_orientation(orientation: str) -> float | None:
+    """Map a detector orientation label to a canonical gripper yaw (rad).
+
+    Returns None when the label is "unknown", empty, or unrecognized —
+    callers should then fall back to bbox-long-edge estimation.
+    """
+    if not isinstance(orientation, str):
+        return None
+    v = orientation.strip().lower().replace("-", "_").replace(" ", "_")
+    v = _ORIENTATION_ALIASES.get(v, v)
+    if v in _ORIENTATION_YAW_RAD:
+        return float(_ORIENTATION_YAW_RAD[v])
+    return None
+
 _state_lock = threading.Lock()
 _initialized = False
 _resolved_cfg: dict[str, Any] = {}
@@ -104,7 +149,22 @@ def _pixel_to_arm_xy(u: float, v: float) -> tuple[float, float]:
 def _gripper_angle_by_longer(
     u: float, v: float, w: float, h: float, angle_deg: float
 ) -> float:
-    """roboarm Arm.gripper_angle_by_longer() without requiring cv2."""
+    """roboarm Arm.gripper_angle_by_longer() without requiring cv2.
+
+    ``angle_deg`` is the bbox's rotation w.r.t. the image x-axis, in
+    degrees. It exists to support rotated / oriented bounding boxes
+    (OBB) from a future detector (e.g. YOLO-OBB, ``cv2.minAreaRect``).
+
+    NOTE (OBB not wired in yet): the current LLM detector
+    (``service-object-detect-rbnx``) — and any plain axis-aligned
+    detector like standard YOLO — only emits 4-element bboxes
+    ``[x_min, y_min, x_max, y_max]``, so in practice ``angle_deg`` is
+    always ``0.0`` and the rotation matrix below collapses to identity.
+    The function then degenerates to a simple "wider ⇒ yaw=pi/2,
+    taller ⇒ yaw=0" binary decision, which is exactly why we added the
+    ``orientation`` label path in ``_compute_grasp``. Keep this code
+    path so a future OBB detector can plug in without changes here.
+    """
     import numpy as np
 
     theta = math.radians(float(angle_deg))
@@ -171,6 +231,7 @@ def _compute_grasp(
     bbox_2d: list[float],
     cfg: dict[str, Any],
     object_name: str = "",
+    orientation: str = "",
 ) -> dict[str, Any]:
     """Compute a vertical grasp pose from a detector bbox."""
     output_frame = str(cfg.get("output_frame", _DEFAULT_BASE_FRAME))
@@ -187,12 +248,19 @@ def _compute_grasp(
     desktop_height = float(cfg["default_desktop_height"])
     catch_offset = float(cfg.get("catch_offset", _DEFAULT_CATCH_OFFSET))
     width = float(cfg.get("gripper_width_default", 0.04))
+    # OBB not wired in yet: no current detector (LLM or axis-aligned
+    # YOLO) supplies a rotation. ``box_rotation_deg`` from config and
+    # the 5th bbox element below are reserved for a future OBB detector
+    # (e.g. YOLO-OBB, cv2.minAreaRect). In today's deployment both are
+    # effectively ``0.0`` and ``_gripper_angle_by_longer`` operates on
+    # an axis-aligned bbox.
     box_rotation_deg = float(
         cfg.get("box_rotation_deg", _DEFAULT_BOX_ROTATION_DEG)
     )
 
     x_min, y_min, x_max, y_max = (float(value) for value in bbox_2d[:4])
     if len(bbox_2d) == 5:
+        # Reserved for future OBB detector output — never hit today.
         box_rotation_deg = float(bbox_2d[4])
     u = 0.5 * (x_min + x_max)
     v_pix = 0.5 * (y_min + y_max)
@@ -208,9 +276,23 @@ def _compute_grasp(
     except ValueError as e:
         return _failure(f"pixel2pos failed: {e}", output_frame)
 
-    yaw_rad = _gripper_angle_by_longer(
-        u, v_pix, bbox_w, bbox_h, box_rotation_deg
-    )
+    # Prefer an explicit detector-supplied orientation label when available;
+    # fall back to the bbox-long-edge heuristic otherwise. Both branches
+    # produce a yaw in the same convention (gripper closing line vs. image
+    # x-axis, in (-pi/2, pi/2]).
+    yaw_source: str
+    yaw_from_label = _yaw_from_orientation(orientation)
+    if yaw_from_label is not None:
+        yaw_rad = yaw_from_label
+        yaw_source = f"orientation={orientation!r}"
+    else:
+        yaw_rad = _gripper_angle_by_longer(
+            u, v_pix, bbox_w, bbox_h, box_rotation_deg
+        )
+        yaw_source = (
+            f"bbox_long_edge (orientation={orientation!r} not usable)"
+            if orientation else "bbox_long_edge"
+        )
     catch_dx = catch_offset * math.cos(yaw_rad)
     catch_dy = catch_offset * math.sin(-yaw_rad)
     grasp_x = target_x + catch_dx
@@ -222,16 +304,19 @@ def _compute_grasp(
     log.info(
         "roboarm grasp: object=%r uv=(%.1f,%.1f) bbox=(%.1fx%.1f, rot=%.1f) "
         "raw_xy=(x=%.3f, y=%.3f) bias=(%.3f, %.3f) biased_xy=(x=%.3f, y=%.3f) "
-        "catch_offset=(dx=%.3f, dy=%.3f) -> grasp=(x=%.3f, y=%.3f, z=%.3f) yaw=%.3f",
+        "catch_offset=(dx=%.3f, dy=%.3f) -> grasp=(x=%.3f, y=%.3f, z=%.3f) "
+        "yaw=%.3f (via %s)",
         object_name, u, v_pix, bbox_w, bbox_h, box_rotation_deg,
         raw_x, raw_y, bias_x, bias_y, target_x, target_y,
-        catch_dx, catch_dy, grasp_x, grasp_y, desktop_height, yaw_rad)
+        catch_dx, catch_dy, grasp_x, grasp_y, desktop_height, yaw_rad,
+        yaw_source)
 
     return {
         "success": True,
         "message": (
             f"ok (object={object_name!r}, u,v=({u:.1f},{v_pix:.1f}), "
-            f"arm_xy=({grasp_x:.3f},{grasp_y:.3f}), yaw={yaw_rad:.3f})"
+            f"arm_xy=({grasp_x:.3f},{grasp_y:.3f}), yaw={yaw_rad:.3f}, "
+            f"yaw_via={yaw_source})"
         ),
         "pose": {
             "position": {
@@ -247,7 +332,12 @@ def _compute_grasp(
     }
 
 
-def _serve_grasp_request(*, object_name: str, bbox_2d: list[float]) -> dict[str, Any]:
+def _serve_grasp_request(
+    *,
+    object_name: str,
+    bbox_2d: list[float],
+    orientation: str = "",
+) -> dict[str, Any]:
     if not bbox_2d:
         return _failure(
             "bbox_2d is required; pick_skill should call object_detect first",
@@ -257,6 +347,7 @@ def _serve_grasp_request(*, object_name: str, bbox_2d: list[float]) -> dict[str,
         bbox_2d=bbox_2d,
         cfg=_resolved_cfg,
         object_name=object_name,
+        orientation=orientation,
     )
 
 
@@ -316,9 +407,15 @@ import builtin_interfaces_pb2  # noqa: E402
 @grasp_pose.grpc("robonix/service/perception/grasp_pose/grasp_request")
 def grasp_request(req: grasp_pb2.GraspRequest_Request) -> grasp_pb2.GraspRequest_Response:
     """Compute a grasp pose from a caller-supplied RGB bbox."""
+    # `orientation` is a new optional string field on GraspRequest.srv.
+    # Older callers that haven't been rebuilt against the updated proto
+    # will simply lack the attribute; treat that as "" so we fall back
+    # to the bbox-long-edge yaw estimation.
+    orientation = getattr(req, "orientation", "") or ""
     result = _serve_grasp_request(
         object_name=req.object_name,
         bbox_2d=list(req.bbox_2d) if req.bbox_2d else [],
+        orientation=str(orientation),
     )
     p = result["pose"]
     pose_stamped = geometry_msgs_pb2.PoseStamped(

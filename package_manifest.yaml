@@ -34,6 +34,12 @@
 #                                            computed gripper yaw.
 #   box_rotation_deg            float       default 0.0 — used when bbox_2d
 #                                            has no fifth rotation element.
+#                                            OBB not wired in yet: today's
+#                                            detectors (LLM / axis-aligned
+#                                            YOLO) always emit 4-element
+#                                            bboxes, so this has no effect.
+#                                            Reserved for a future OBB
+#                                            detector (YOLO-OBB, minAreaRect).
 #   approach_dist               float       default 0.10  — hover height for
 #                                            pre/post grasp (m). Used by
 #                                            pick_skill_rbnx.

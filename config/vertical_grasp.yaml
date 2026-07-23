@@ -32,6 +32,11 @@ roboarm_grasp:
   # If bbox_2d has only [x_min, y_min, x_max, y_max], this rotation is
   # used when computing roboarm's long-edge gripper yaw. If a future
   # detector passes bbox_2d length 5, the fifth value overrides this.
+  #
+  # NOTE: OBB (oriented bounding box) is not wired in yet. The current
+  # LLM detector and standard axis-aligned YOLO both emit 4-element
+  # bboxes, so this value has no effect in the current deployment.
+  # Reserved for a future OBB detector (e.g. YOLO-OBB, minAreaRect).
   box_rotation_deg: 0.0
 
   # Pose output frame consumed by roboarm_ik.
